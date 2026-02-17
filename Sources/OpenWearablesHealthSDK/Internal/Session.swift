@@ -105,7 +105,7 @@ extension OpenWearablesHealthSDK {
         saveSyncState(state)
     }
     
-    internal func clearSyncSession() {
+    public func clearSyncSession() {
         try? FileManager.default.removeItem(at: syncStateFilePath())
         try? FileManager.default.removeItem(at: anchorsFilePath())
         logMessage("Cleared sync state")
