@@ -1,3 +1,0 @@
-module OpenWearablesHealthSDK {
-    header "/Users/kamilpiekarz/StudioProjects/OpenWearablesHealthSDK/.build/arm64-apple-macosx/debug/OpenWearablesHealthSDK.build/include/OpenWearablesHealthSDK-Swift.h"
-}
