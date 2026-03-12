@@ -18,6 +18,7 @@ internal class OpenWearablesHealthSdkKeychain {
     private static let syncActiveKey = "syncActive"
     private static let trackedTypesKey = "trackedTypes"
     private static let appInstalledKey = "appInstalled"
+    private static let syncDaysBackKey = "syncDaysBack"
     
     // MARK: - Fresh Install Detection
     
@@ -129,6 +130,18 @@ internal class OpenWearablesHealthSdkKeychain {
         return defaults.stringArray(forKey: trackedTypesKey)
     }
     
+    // MARK: - Sync Days Back
+    
+    static func saveSyncDaysBack(_ days: Int) {
+        defaults.set(days, forKey: syncDaysBackKey)
+        defaults.synchronize()
+    }
+    
+    /// Returns the stored sync days back, or 0 if not set (meaning full sync / no limit).
+    static func getSyncDaysBack() -> Int {
+        return defaults.integer(forKey: syncDaysBackKey)
+    }
+    
     // MARK: - API Key (alternative auth mode)
     
     static func saveApiKey(_ apiKey: String) {
@@ -150,6 +163,7 @@ internal class OpenWearablesHealthSdkKeychain {
         defaults.removeObject(forKey: customSyncUrlKey)
         defaults.removeObject(forKey: syncActiveKey)
         defaults.removeObject(forKey: trackedTypesKey)
+        defaults.removeObject(forKey: syncDaysBackKey)
         defaults.synchronize()
     }
     

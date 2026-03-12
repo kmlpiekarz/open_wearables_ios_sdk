@@ -148,7 +148,6 @@ extension OpenWearablesHealthSDK {
         req.setValue("\(payloadData.count)", forHTTPHeaderField: "Content-Length")
         
         self.logPayloadSummary(payloadData, label: "Sending")
-        self.logPayloadToConsole(payloadData, label: "UPLOAD")
 
         let task = foregroundSession.dataTask(with: req) { [weak self] data, response, error in
             guard let self = self else { return }
