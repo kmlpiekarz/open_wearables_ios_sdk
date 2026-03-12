@@ -4,6 +4,17 @@ import HealthKit
 import BackgroundTasks
 import Network
 
+/// Controls which log messages the SDK emits.
+///
+/// - `none`:   No logs at all (neither console nor `onLog` callback).
+/// - `always`: Logs are always emitted (console + callback).
+/// - `debug`:  Logs are emitted only in debug builds (the default).
+@objc public enum OWLogLevel: Int {
+    case none = 0
+    case always = 1
+    case debug = 2
+}
+
 /// Main entry point for the Open Wearables Health SDK.
 /// Use `OpenWearablesHealthSDK.shared` to access the singleton instance.
 ///
@@ -19,12 +30,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.6.0"
+    internal static let sdkVersion = "0.7.0"
     
     // MARK: - Public Callbacks
     
     /// Called whenever the SDK logs a message. Set this to receive log output.
     public var onLog: ((String) -> Void)?
+    
+    /// Current log level. Default is `.debug` (logs only in debug builds).
+    public var logLevel: OWLogLevel = .debug
     
     /// Called when an authentication error occurs (e.g., 401 Unauthorized).
     /// Parameters: (statusCode: Int, message: String)
@@ -289,8 +303,28 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     // MARK: - Public API: Sync
     
+    /// Computes the earliest date to sync from, based on persisted `syncDaysBack`.
+    /// Returns the start of the day (midnight local time) that many days ago,
+    /// or `nil` if full sync (no limit) is configured.
+    internal func syncStartDate() -> Date? {
+        let daysBack = OpenWearablesHealthSdkKeychain.getSyncDaysBack()
+        guard daysBack > 0 else { return nil }
+        let calendar = Calendar.current
+        let startOfToday = calendar.startOfDay(for: Date())
+        return calendar.date(byAdding: .day, value: -daysBack, to: startOfToday) ?? startOfToday
+    }
+    
     /// Start background sync (registers HealthKit observers, schedules BG tasks, triggers initial sync).
-    public func startBackgroundSync(completion: @escaping (Bool) -> Void) {
+    ///
+    /// - Parameters:
+    ///   - syncDaysBack: How many days back to sync. Syncs from the start of the day
+    ///     that many days ago (inclusive). When `nil` (the default), syncs all available history.
+    ///   - completion: Called with `true` if sync started successfully.
+    public func startBackgroundSync(syncDaysBack: Int? = nil, completion: @escaping (Bool) -> Void) {
+        if let days = syncDaysBack {
+            OpenWearablesHealthSdkKeychain.saveSyncDaysBack(days)
+            logMessage("Sync days back set to \(days)")
+        }
         guard userId != nil, hasAuth else {
             logMessage("Cannot start sync: not signed in")
             completion(false)
@@ -647,7 +681,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let anchor = loadAnchor(for: type)
         logMessage("\(shortTypeName(type.identifier)): querying...")
         
-        let query = HKAnchoredObjectQuery(type: type, predicate: nil, anchor: anchor, limit: chunkLimit) {
+        let syncPredicate: NSPredicate? = {
+            guard let start = syncStartDate() else { return nil }
+            return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
+        }()
+        let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: chunkLimit) {
             [weak self] _, samplesOrNil, deletedObjects, newAnchor, error in
             autoreleasepool {
                 guard let self = self else { completion(false); return }
@@ -723,9 +761,12 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         syncLock.unlock()
         if cancelled { completion(false); return }
         
+        let startDate = syncStartDate()
         var predicate: NSPredicate? = nil
         if let olderThan = olderThan {
-            predicate = HKQuery.predicateForSamples(withStart: nil, end: olderThan, options: .strictEndDate)
+            predicate = HKQuery.predicateForSamples(withStart: startDate, end: olderThan, options: .strictEndDate)
+        } else if startDate != nil {
+            predicate = HKQuery.predicateForSamples(withStart: startDate, end: nil, options: [])
         }
         
         let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
@@ -798,7 +839,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     private func captureAnchorStep(type: HKSampleType, anchor: HKQueryAnchor?, limit: Int, completion: @escaping (HKQueryAnchor?) -> Void) {
-        let query = HKAnchoredObjectQuery(type: type, predicate: nil, anchor: anchor, limit: limit) {
+        let syncPredicate: NSPredicate? = {
+            guard let start = syncStartDate() else { return nil }
+            return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
+        }()
+        let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: limit) {
             [weak self] _, samples, _, newAnchor, error in
             guard let self = self else { completion(nil); return }
             let count = samples?.count ?? 0
@@ -815,7 +860,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         type: HKSampleType, anchor: HKQueryAnchor?, endpoint: URL,
         credential: String, chunkLimit: Int, completion: @escaping (Bool) -> Void
     ) {
-        let query = HKAnchoredObjectQuery(type: type, predicate: nil, anchor: anchor, limit: chunkLimit) {
+        let syncPredicate: NSPredicate? = {
+            guard let start = syncStartDate() else { return nil }
+            return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
+        }()
+        let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: chunkLimit) {
             [weak self] _, samplesOrNil, deletedObjects, newAnchor, error in
             autoreleasepool {
                 guard let self = self else { completion(false); return }
@@ -940,7 +989,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal func syncType(_ type: HKSampleType, fullExport: Bool, completion: @escaping () -> Void) {
         let anchor = fullExport ? nil : loadAnchor(for: type)
         
-        let query = HKAnchoredObjectQuery(type: type, predicate: nil, anchor: anchor, limit: chunkSize) {
+        let syncPredicate: NSPredicate? = {
+            guard let start = syncStartDate() else { return nil }
+            return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
+        }()
+        let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: chunkSize) {
             [weak self] _, samplesOrNil, deletedObjects, newAnchor, error in
             guard let self = self else { completion(); return }
             guard error == nil else { completion(); return }
@@ -967,7 +1020,22 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     // MARK: - Logging
     
+    /// Sets the log level. Convenience wrapper for Objective-C / Flutter bridge.
+    public func setLogLevel(_ level: OWLogLevel) {
+        self.logLevel = level
+    }
+    
     internal func logMessage(_ message: String) {
+        switch logLevel {
+        case .none:
+            return
+        case .always:
+            break
+        case .debug:
+            #if !DEBUG
+            return
+            #endif
+        }
         NSLog("[OpenWearablesHealthSDK] %@", message)
         onLog?(message)
     }
@@ -1070,69 +1138,114 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     // MARK: - Payload Logging
     
-    internal func logPayloadToConsole(_ data: Data, label: String) {
-        #if DEBUG
-        if let jsonObject = try? JSONSerialization.jsonObject(with: data, options: []),
-           let prettyData = try? JSONSerialization.data(withJSONObject: jsonObject, options: [.prettyPrinted, .sortedKeys]),
-           let prettyString = String(data: prettyData, encoding: .utf8) {
-            NSLog("[OpenWearablesHealthSDK] ========== %@ PAYLOAD START ==========", label)
-            let chunkSize = 800
-            var index = prettyString.startIndex
-            while index < prettyString.endIndex {
-                let endIndex = prettyString.index(index, offsetBy: chunkSize, limitedBy: prettyString.endIndex) ?? prettyString.endIndex
-                let chunk = String(prettyString[index..<endIndex])
-                NSLog("[OpenWearablesHealthSDK] %@", chunk)
-                index = endIndex
-            }
-            NSLog("[OpenWearablesHealthSDK] ========== %@ PAYLOAD END (%d bytes) ==========", label, data.count)
-        }
-        #endif
-    }
-    
     internal func logPayloadSummary(_ data: Data, label: String) {
         guard let jsonObject = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
               let dataDict = jsonObject["data"] as? [String: Any] else {
-            let sizeMB = Double(data.count) / (1024 * 1024)
-            logMessage("\(label): \(String(format: "%.2f", sizeMB)) MB")
+            let sizeKB = Double(data.count) / 1024
+            logMessage("\(label): \(String(format: "%.0f", sizeKB)) KB")
             return
         }
         
-        var summary: [String] = []
+        let dateFmt = DateFormatter()
+        dateFmt.dateFormat = "yyyy-MM-dd HH:mm"
+        let isoFmt = ISO8601DateFormatter()
         
-        if let records = dataDict["records"] as? [[String: Any]] {
-            var typeCounts: [String: Int] = [:]
-            for record in records {
-                if let type = record["type"] as? String {
-                    let shortType = type.replacingOccurrences(of: "HKQuantityTypeIdentifier", with: "")
-                        .replacingOccurrences(of: "HKCategoryTypeIdentifier", with: "")
-                    typeCounts[shortType, default: 0] += 1
+        struct TypeStats {
+            var count: Int = 0
+            var minDate: Date?
+            var maxDate: Date?
+            var dailyValues: [String: Double] = [:]
+            var unit: String?
+            mutating func add(_ date: Date?, value: Double? = nil, unit: String? = nil, dayKey: String? = nil) {
+                count += 1
+                if let u = unit { self.unit = u }
+                if let d = date {
+                    if minDate == nil || d < minDate! { minDate = d }
+                    if maxDate == nil || d > maxDate! { maxDate = d }
+                }
+                if let dk = dayKey, let v = value {
+                    dailyValues[dk, default: 0] += v
                 }
             }
-            if !typeCounts.isEmpty {
-                let typesList = typeCounts.sorted { $0.value > $1.value }
-                    .map { "\($0.key): \($0.value)" }.joined(separator: ", ")
-                summary.append("Records: \(records.count) [\(typesList)]")
+        }
+        
+        let dayFmt = DateFormatter()
+        dayFmt.dateFormat = "yyyy-MM-dd"
+        
+        let valueSumShortTypes: Set<String> = [
+            "stepcount",
+            "activeenergyburned",
+            "basalenergyburned",
+            "distancewalkingrunning",
+            "flightsclimbed",
+        ]
+        
+        var typeStats: [String: TypeStats] = [:]
+        
+        if let records = dataDict["records"] as? [[String: Any]] {
+            for record in records {
+                guard let type = record["type"] as? String else { continue }
+                let shortType = type
+                    .replacingOccurrences(of: "HKQuantityTypeIdentifier", with: "")
+                    .replacingOccurrences(of: "HKCategoryTypeIdentifier", with: "")
+                let date = (record["startDate"] as? String).flatMap { isoFmt.date(from: $0) }
+                let trackValues = valueSumShortTypes.contains(shortType.lowercased())
+                let value = trackValues ? (record["value"] as? Double) : nil
+                let unit = trackValues ? (record["unit"] as? String) : nil
+                let dayKey = (trackValues && date != nil) ? dayFmt.string(from: date!) : nil
+                typeStats[shortType, default: TypeStats()].add(date, value: value, unit: unit, dayKey: dayKey)
+            }
+        }
+        
+        if let sleep = dataDict["sleep"] as? [[String: Any]], !sleep.isEmpty {
+            for record in sleep {
+                let date = (record["startDate"] as? String).flatMap { isoFmt.date(from: $0) }
+                typeStats["sleep", default: TypeStats()].add(date)
             }
         }
         
         if let workouts = dataDict["workouts"] as? [[String: Any]], !workouts.isEmpty {
-            var workoutTypes: [String: Int] = [:]
             for workout in workouts {
-                if let type = workout["type"] as? String { workoutTypes[type, default: 0] += 1 }
+                let wType = (workout["type"] as? String) ?? "workout"
+                let date = (workout["startDate"] as? String).flatMap { isoFmt.date(from: $0) }
+                typeStats["workout/\(wType)", default: TypeStats()].add(date)
             }
-            let workoutsList = workoutTypes.sorted { $0.value > $1.value }
-                .map { "\($0.key): \($0.value)" }.joined(separator: ", ")
-            summary.append("Workouts: \(workouts.count) [\(workoutsList)]")
         }
         
-        let sizeMB = Double(data.count) / (1024 * 1024)
-        let sizeStr = String(format: "%.2f MB", sizeMB)
+        let sizeKB = Double(data.count) / 1024
+        let totalCount = typeStats.values.reduce(0) { $0 + $1.count }
+        logMessage("\(label) \(String(format: "%.0f", sizeKB)) KB, \(totalCount) items:")
         
-        if summary.isEmpty {
-            logMessage("\(label): \(sizeStr)")
-        } else {
-            logMessage("\(label): \(sizeStr) - \(summary.joined(separator: ", "))")
+        for (type, stats) in typeStats.sorted(by: { $0.value.count > $1.value.count }) {
+            let range: String
+            if let min = stats.minDate, let max = stats.maxDate {
+                range = "\(dateFmt.string(from: min)) → \(dateFmt.string(from: max))"
+            } else {
+                range = "no dates"
+            }
+            
+            if stats.dailyValues.isEmpty {
+                logMessage("  ✅ \(type): \(stats.count) (\(range))")
+            } else {
+                let total = stats.dailyValues.values.reduce(0, +)
+                let unitStr = stats.unit ?? ""
+                logMessage("  ✅ \(type): \(stats.count) samples, \(Self.formatNumber(total)) \(unitStr) total (\(range))")
+                for day in stats.dailyValues.keys.sorted() {
+                    let dayVal = stats.dailyValues[day]!
+                    logMessage("     \(day): \(Self.formatNumber(dayVal)) \(unitStr)")
+                }
+            }
         }
+    }
+    
+    private static func formatNumber(_ value: Double) -> String {
+        if value == value.rounded() && value < 1e15 {
+            let formatter = NumberFormatter()
+            formatter.numberStyle = .decimal
+            formatter.maximumFractionDigits = 0
+            return formatter.string(from: NSNumber(value: value)) ?? "\(Int(value))"
+        }
+        return String(format: "%.1f", value)
     }
     
     // MARK: - Network Monitoring
