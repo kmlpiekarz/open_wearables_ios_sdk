@@ -198,7 +198,7 @@ extension OpenWearablesHealthSDK {
                     "type": s.sampleType.identifier,
                     "startDate": df.string(from: s.startDate),
                     "endDate": df.string(from: s.endDate),
-                    "zoneOffset": NSNull(),
+                    "zoneOffset": _zoneOffsetString(metadata: s.metadata, date: s.startDate),
                     "source": _mapSource(s.sourceRevision, device: s.device),
                     "value": NSNull(),
                     "unit": NSNull(),
@@ -253,7 +253,7 @@ extension OpenWearablesHealthSDK {
                             "type": s.sampleType.identifier,
                             "startDate": dateFormatter.string(from: s.startDate),
                             "endDate": dateFormatter.string(from: s.endDate),
-                            "zoneOffset": NSNull(),
+                            "zoneOffset": _zoneOffsetString(metadata: s.metadata, date: s.startDate),
                             "source": _mapSource(s.sourceRevision, device: s.device),
                             "value": NSNull(),
                             "unit": NSNull(),
@@ -303,7 +303,7 @@ extension OpenWearablesHealthSDK {
                     "type": s.sampleType.identifier,
                     "startDate": df.string(from: s.startDate),
                     "endDate": df.string(from: s.endDate),
-                    "zoneOffset": NSNull(),
+                    "zoneOffset": _zoneOffsetString(metadata: s.metadata, date: s.startDate),
                     "source": _mapSource(s.sourceRevision, device: s.device),
                     "value": NSNull(),
                     "unit": NSNull(),
@@ -363,7 +363,7 @@ extension OpenWearablesHealthSDK {
             "type": q.quantityType.identifier,
             "startDate": df.string(from: q.startDate),
             "endDate": df.string(from: q.endDate),
-            "zoneOffset": NSNull(),
+            "zoneOffset": _zoneOffsetString(metadata: q.metadata, date: q.startDate),
             "source": _mapSource(q.sourceRevision, device: q.device),
             "value": value,
             "unit": finalUnit,
@@ -379,7 +379,7 @@ extension OpenWearablesHealthSDK {
             "type": c.categoryType.identifier,
             "startDate": df.string(from: c.startDate),
             "endDate": df.string(from: c.endDate),
-            "zoneOffset": NSNull(),
+            "zoneOffset": _zoneOffsetString(metadata: c.metadata, date: c.startDate),
             "source": _mapSource(c.sourceRevision, device: c.device),
             "value": c.value,
             "unit": NSNull(),
@@ -396,7 +396,7 @@ extension OpenWearablesHealthSDK {
             "stage": _sleepStageString(c.value),
             "startDate": df.string(from: c.startDate),
             "endDate": df.string(from: c.endDate),
-            "zoneOffset": NSNull(),
+            "zoneOffset": _zoneOffsetString(metadata: c.metadata, date: c.startDate),
             "source": _mapSource(c.sourceRevision, device: c.device),
             "values": NSNull(),
             "metadata": NSNull()
@@ -417,7 +417,7 @@ extension OpenWearablesHealthSDK {
                     "type": q.quantityType.identifier,
                     "startDate": df.string(from: q.startDate),
                     "endDate": df.string(from: q.endDate),
-                    "zoneOffset": NSNull(),
+                    "zoneOffset": _zoneOffsetString(metadata: q.metadata, fallback: corr.metadata, date: q.startDate),
                     "source": source,
                     "value": value,
                     "unit": unitOut,
@@ -439,7 +439,7 @@ extension OpenWearablesHealthSDK {
             "type": _workoutTypeString(w.workoutActivityType),
             "startDate": df.string(from: w.startDate),
             "endDate": df.string(from: w.endDate),
-            "zoneOffset": NSNull(),
+            "zoneOffset": _zoneOffsetString(metadata: w.metadata, date: w.startDate),
             "source": _mapSource(w.sourceRevision, device: w.device),
             "title": NSNull(),
             "notes": NSNull(),
@@ -668,7 +668,7 @@ extension OpenWearablesHealthSDK {
             "type": q.quantityType.identifier,
             "startDate": dateFormatter.string(from: q.startDate),
             "endDate": dateFormatter.string(from: q.endDate),
-            "zoneOffset": NSNull(),
+            "zoneOffset": _zoneOffsetString(metadata: q.metadata, date: q.startDate),
             "source": _mapSource(q.sourceRevision, device: q.device),
             "value": value,
             "unit": finalUnit,
@@ -683,7 +683,7 @@ extension OpenWearablesHealthSDK {
             "type": c.categoryType.identifier,
             "startDate": dateFormatter.string(from: c.startDate),
             "endDate": dateFormatter.string(from: c.endDate),
-            "zoneOffset": NSNull(),
+            "zoneOffset": _zoneOffsetString(metadata: c.metadata, date: c.startDate),
             "source": _mapSource(c.sourceRevision, device: c.device),
             "value": c.value,
             "unit": NSNull(),
@@ -699,7 +699,7 @@ extension OpenWearablesHealthSDK {
             "stage": _sleepStageString(c.value),
             "startDate": dateFormatter.string(from: c.startDate),
             "endDate": dateFormatter.string(from: c.endDate),
-            "zoneOffset": NSNull(),
+            "zoneOffset": _zoneOffsetString(metadata: c.metadata, date: c.startDate),
             "source": _mapSource(c.sourceRevision, device: c.device),
             "values": NSNull(),
             "metadata": NSNull()
@@ -719,7 +719,7 @@ extension OpenWearablesHealthSDK {
                     "type": q.quantityType.identifier,
                     "startDate": dateFormatter.string(from: q.startDate),
                     "endDate": dateFormatter.string(from: q.endDate),
-                    "zoneOffset": NSNull(),
+                    "zoneOffset": _zoneOffsetString(metadata: q.metadata, fallback: corr.metadata, date: q.startDate),
                     "source": source,
                     "value": value,
                     "unit": unitOut,
@@ -740,7 +740,7 @@ extension OpenWearablesHealthSDK {
             "type": _workoutTypeString(w.workoutActivityType),
             "startDate": dateFormatter.string(from: w.startDate),
             "endDate": dateFormatter.string(from: w.endDate),
-            "zoneOffset": NSNull(),
+            "zoneOffset": _zoneOffsetString(metadata: w.metadata, date: w.startDate),
             "source": _mapSource(w.sourceRevision, device: w.device),
             "title": NSNull(),
             "notes": NSNull(),
@@ -898,6 +898,26 @@ extension OpenWearablesHealthSDK {
             result[k] = "\(v)"
         }
         return result
+    }
+    
+    // MARK: - Zone Offset
+    
+    private func _zoneOffsetString(metadata: [String: Any]?, fallback: [String: Any]? = nil, date: Date) -> Any {
+        if let tzName = metadata?[HKMetadataKeyTimeZone] as? String,
+           let tz = TimeZone(identifier: tzName) {
+            return _formatZoneOffset(tz.secondsFromGMT(for: date))
+        }
+        if let tzName = fallback?[HKMetadataKeyTimeZone] as? String,
+           let tz = TimeZone(identifier: tzName) {
+            return _formatZoneOffset(tz.secondsFromGMT(for: date))
+        }
+        return NSNull()
+    }
+    
+    private func _formatZoneOffset(_ totalSeconds: Int) -> String {
+        let sign = totalSeconds >= 0 ? "+" : "-"
+        let abs = Swift.abs(totalSeconds)
+        return String(format: "%@%02d:%02d", sign, abs / 3600, (abs % 3600) / 60)
     }
     
     // MARK: - Sleep stage mapping
