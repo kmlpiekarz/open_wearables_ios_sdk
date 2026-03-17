@@ -30,7 +30,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.8.0"
+    internal static let sdkVersion = "0.9.0"
     
     // MARK: - Public Callbacks
     
@@ -1139,48 +1139,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // MARK: - Payload Logging
     
     internal func logPayloadSummary(_ data: Data, label: String) {
+        let sizeKB = Double(data.count) / 1024
+        
         guard let jsonObject = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
               let dataDict = jsonObject["data"] as? [String: Any] else {
-            let sizeKB = Double(data.count) / 1024
             logMessage("\(label): \(String(format: "%.0f", sizeKB)) KB")
             return
         }
         
-        let dateFmt = DateFormatter()
-        dateFmt.dateFormat = "yyyy-MM-dd HH:mm"
-        let isoFmt = ISO8601DateFormatter()
-        
-        struct TypeStats {
-            var count: Int = 0
-            var minDate: Date?
-            var maxDate: Date?
-            var dailyValues: [String: Double] = [:]
-            var unit: String?
-            mutating func add(_ date: Date?, value: Double? = nil, unit: String? = nil, dayKey: String? = nil) {
-                count += 1
-                if let u = unit { self.unit = u }
-                if let d = date {
-                    if minDate == nil || d < minDate! { minDate = d }
-                    if maxDate == nil || d > maxDate! { maxDate = d }
-                }
-                if let dk = dayKey, let v = value {
-                    dailyValues[dk, default: 0] += v
-                }
-            }
-        }
-        
-        let dayFmt = DateFormatter()
-        dayFmt.dateFormat = "yyyy-MM-dd"
-        
-        let valueSumShortTypes: Set<String> = [
-            "stepcount",
-            "activeenergyburned",
-            "basalenergyburned",
-            "distancewalkingrunning",
-            "flightsclimbed",
-        ]
-        
-        var typeStats: [String: TypeStats] = [:]
+        var typeCounts: [String: Int] = [:]
         
         if let records = dataDict["records"] as? [[String: Any]] {
             for record in records {
@@ -1188,64 +1155,23 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 let shortType = type
                     .replacingOccurrences(of: "HKQuantityTypeIdentifier", with: "")
                     .replacingOccurrences(of: "HKCategoryTypeIdentifier", with: "")
-                let date = (record["startDate"] as? String).flatMap { isoFmt.date(from: $0) }
-                let trackValues = valueSumShortTypes.contains(shortType.lowercased())
-                let value = trackValues ? (record["value"] as? Double) : nil
-                let unit = trackValues ? (record["unit"] as? String) : nil
-                let dayKey = (trackValues && date != nil) ? dayFmt.string(from: date!) : nil
-                typeStats[shortType, default: TypeStats()].add(date, value: value, unit: unit, dayKey: dayKey)
+                typeCounts[shortType, default: 0] += 1
             }
         }
-        
         if let sleep = dataDict["sleep"] as? [[String: Any]], !sleep.isEmpty {
-            for record in sleep {
-                let date = (record["startDate"] as? String).flatMap { isoFmt.date(from: $0) }
-                typeStats["sleep", default: TypeStats()].add(date)
-            }
+            typeCounts["sleep"] = sleep.count
         }
-        
         if let workouts = dataDict["workouts"] as? [[String: Any]], !workouts.isEmpty {
-            for workout in workouts {
-                let wType = (workout["type"] as? String) ?? "workout"
-                let date = (workout["startDate"] as? String).flatMap { isoFmt.date(from: $0) }
-                typeStats["workout/\(wType)", default: TypeStats()].add(date)
-            }
+            typeCounts["workouts"] = workouts.count
         }
         
-        let sizeKB = Double(data.count) / 1024
-        let totalCount = typeStats.values.reduce(0) { $0 + $1.count }
-        logMessage("\(label) \(String(format: "%.0f", sizeKB)) KB, \(totalCount) items:")
+        let totalCount = typeCounts.values.reduce(0, +)
+        let breakdown = typeCounts
+            .sorted { $0.value > $1.value }
+            .map { "\($0.key): \($0.value)" }
+            .joined(separator: ", ")
         
-        for (type, stats) in typeStats.sorted(by: { $0.value.count > $1.value.count }) {
-            let range: String
-            if let min = stats.minDate, let max = stats.maxDate {
-                range = "\(dateFmt.string(from: min)) → \(dateFmt.string(from: max))"
-            } else {
-                range = "no dates"
-            }
-            
-            if stats.dailyValues.isEmpty {
-                logMessage("  ✅ \(type): \(stats.count) (\(range))")
-            } else {
-                let total = stats.dailyValues.values.reduce(0, +)
-                let unitStr = stats.unit ?? ""
-                logMessage("  ✅ \(type): \(stats.count) samples, \(Self.formatNumber(total)) \(unitStr) total (\(range))")
-                for day in stats.dailyValues.keys.sorted() {
-                    let dayVal = stats.dailyValues[day]!
-                    logMessage("     \(day): \(Self.formatNumber(dayVal)) \(unitStr)")
-                }
-            }
-        }
-    }
-    
-    private static func formatNumber(_ value: Double) -> String {
-        if value == value.rounded() && value < 1e15 {
-            let formatter = NumberFormatter()
-            formatter.numberStyle = .decimal
-            formatter.maximumFractionDigits = 0
-            return formatter.string(from: NSNumber(value: value)) ?? "\(Int(value))"
-        }
-        return String(format: "%.1f", value)
+        logMessage("\(label) \(String(format: "%.0f", sizeKB)) KB, \(totalCount) items (\(breakdown))")
     }
     
     // MARK: - Network Monitoring
