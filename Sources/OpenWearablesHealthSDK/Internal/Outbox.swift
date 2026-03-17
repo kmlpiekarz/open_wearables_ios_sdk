@@ -148,13 +148,6 @@ extension OpenWearablesHealthSDK {
         req.setValue("\(payloadData.count)", forHTTPHeaderField: "Content-Length")
         
         self.logPayloadSummary(payloadData, label: "Sending")
-        
-        // TEMP DEBUG: pretty-print full payload (remove before release)
-        if let prettyJson = try? JSONSerialization.jsonObject(with: payloadData),
-           let prettyData = try? JSONSerialization.data(withJSONObject: prettyJson, options: [.prettyPrinted, .sortedKeys]),
-           let prettyStr = String(data: prettyData, encoding: .utf8) {
-            self.logMessage("━━━ FULL PAYLOAD ━━━\n\(prettyStr)\n━━━ END PAYLOAD ━━━")
-        }
 
         let task = foregroundSession.dataTask(with: req) { [weak self] data, response, error in
             guard let self = self else { return }
