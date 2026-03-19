@@ -7,6 +7,7 @@ struct TypeSyncProgress: Codable {
     var sentCount: Int
     var isComplete: Bool
     var pendingAnchorData: Data?
+    var pendingOlderThan: Date?
 }
 
 /// Lightweight sync state - tracks progress per type instead of all UUIDs
@@ -70,20 +71,24 @@ extension OpenWearablesHealthSDK {
         return state
     }
     
-    internal func updateTypeProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Bool, anchorData: Data?) {
+    internal func updateTypeProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Bool, anchorData: Data?, olderThan: Date? = nil) {
         guard var state = loadSyncState() else { return }
         
         var progress = state.typeProgress[typeIdentifier] ?? TypeSyncProgress(
             typeIdentifier: typeIdentifier,
             sentCount: 0,
             isComplete: false,
-            pendingAnchorData: nil
+            pendingAnchorData: nil,
+            pendingOlderThan: nil
         )
         
         progress.sentCount += sentInChunk
         progress.isComplete = isComplete
         if let anchorData = anchorData {
             progress.pendingAnchorData = anchorData
+        }
+        if let olderThan = olderThan {
+            progress.pendingOlderThan = olderThan
         }
         
         state.typeProgress[typeIdentifier] = progress
@@ -160,6 +165,23 @@ extension OpenWearablesHealthSDK {
     internal func getResumeTypeIndex() -> Int {
         guard let state = loadSyncState() else { return 0 }
         return state.currentTypeIndex
+    }
+    
+    internal func getResumeCursors() -> (completedTypes: Set<String>, olderThanCursors: [String: Date], anchorDataCursors: [String: Data]) {
+        guard let state = loadSyncState() else { return ([], [:], [:]) }
+        var olderThanCursors: [String: Date] = [:]
+        var anchorDataCursors: [String: Data] = [:]
+        for (id, progress) in state.typeProgress {
+            if !progress.isComplete {
+                if let olderThan = progress.pendingOlderThan {
+                    olderThanCursors[id] = olderThan
+                }
+                if let anchorData = progress.pendingAnchorData {
+                    anchorDataCursors[id] = anchorData
+                }
+            }
+        }
+        return (state.completedTypes, olderThanCursors, anchorDataCursors)
     }
     
     // MARK: - Get Sync Status

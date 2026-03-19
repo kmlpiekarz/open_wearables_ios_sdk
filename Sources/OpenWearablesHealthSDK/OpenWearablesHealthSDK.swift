@@ -30,7 +30,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.9.0"
+    internal static let sdkVersion = "0.10.0"
     
     // MARK: - Public Callbacks
     
@@ -72,9 +72,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         return authCredential != nil
     }
     
+    private func bearerValue(_ token: String) -> String {
+        return token.hasPrefix("Bearer ") ? token : "Bearer \(token)"
+    }
+    
     internal func applyAuth(to request: inout URLRequest) {
         if let token = accessToken {
-            request.setValue(token, forHTTPHeaderField: "Authorization")
+            request.setValue(bearerValue(token), forHTTPHeaderField: "Authorization")
         } else if let key = apiKey {
             request.setValue(key, forHTTPHeaderField: "X-Open-Wearables-API-Key")
         }
@@ -84,7 +88,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         if isApiKeyAuth {
             request.setValue(credential, forHTTPHeaderField: "X-Open-Wearables-API-Key")
         } else {
-            request.setValue(credential, forHTTPHeaderField: "Authorization")
+            request.setValue(bearerValue(credential), forHTTPHeaderField: "Authorization")
         }
     }
     
@@ -542,7 +546,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         
-        guard let credential = self.authCredential, let endpoint = self.syncEndpoint else {
+        guard self.authCredential != nil, let endpoint = self.syncEndpoint else {
             logMessage("No auth credential or endpoint")
             finishSync()
             completion()
@@ -573,14 +577,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             _ = startNewSyncState(fullExport: effectiveFullExport, types: queryableTypes)
         }
         
-        let startIndex = isResuming ? getResumeTypeIndex() : 0
-        
-        processTypesSequentially(
+        processTypesRoundRobin(
             types: queryableTypes,
-            typeIndex: startIndex,
             fullExport: effectiveFullExport,
             endpoint: endpoint,
-            credential: credential,
             isBackground: isBackground
         ) { [weak self] allTypesCompleted in
             guard let self = self else { return }
@@ -594,172 +594,276 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
     }
     
-    private func processTypesSequentially(
+    // MARK: - Round-Robin Sync Orchestration
+    
+    private class RoundRobinState {
+        var olderThanCursors: [String: Date] = [:]
+        var anchorCursors: [String: HKQueryAnchor] = [:]
+        var completedTypes: Set<String> = []
+    }
+    
+    private func processTypesRoundRobin(
         types: [HKSampleType],
-        typeIndex: Int,
         fullExport: Bool,
         endpoint: URL,
-        credential: String,
         isBackground: Bool,
+        completion: @escaping (Bool) -> Void
+    ) {
+        let chunkLimit = isBackground ? backgroundChunkSize : recordsPerChunk
+        let rrState = RoundRobinState()
+        
+        let resumeInfo = getResumeCursors()
+        rrState.completedTypes = resumeInfo.completedTypes
+        rrState.olderThanCursors = resumeInfo.olderThanCursors
+        for (id, data) in resumeInfo.anchorDataCursors {
+            if let anchor = try? NSKeyedUnarchiver.unarchivedObject(ofClass: HKQueryAnchor.self, from: data) {
+                rrState.anchorCursors[id] = anchor
+            }
+        }
+        
+        if !fullExport {
+            for type in types where !rrState.completedTypes.contains(type.identifier) && rrState.anchorCursors[type.identifier] == nil {
+                if let anchor = loadAnchor(for: type) {
+                    rrState.anchorCursors[type.identifier] = anchor
+                }
+            }
+        }
+        
+        processNextRound(
+            types: types, fullExport: fullExport, endpoint: endpoint,
+            chunkLimit: chunkLimit, rrState: rrState,
+            completion: completion
+        )
+    }
+    
+    // MARK: - Round result for accumulating fetched data
+    
+    private struct TypeRoundResult {
+        let type: HKSampleType
+        let samples: [HKSample]
+        let count: Int
+        let nextOlderThan: Date?
+        let newAnchor: HKQueryAnchor?
+        let anchorData: Data?
+        let isDone: Bool
+    }
+    
+    // MARK: - Round-Robin with combined payloads
+    
+    private func processNextRound(
+        types: [HKSampleType], fullExport: Bool, endpoint: URL,
+        chunkLimit: Int, rrState: RoundRobinState,
         completion: @escaping (Bool) -> Void
     ) {
         syncLock.lock()
         let cancelled = syncCancelled
         syncLock.unlock()
         if cancelled {
-            logMessage("Sync cancelled - stopping type processing")
+            logMessage("Sync cancelled - stopping round-robin")
             completion(false)
             return
         }
         
-        guard typeIndex < types.count else {
+        let incompleteTypes = types.filter { !rrState.completedTypes.contains($0.identifier) }
+        if incompleteTypes.isEmpty {
             completion(true)
             return
         }
         
-        let type = types[typeIndex]
+        let perTypeLimit = max(1, chunkLimit / incompleteTypes.count)
         
-        if !shouldSyncType(type.identifier) {
-            logMessage("Skipping \(shortTypeName(type.identifier)) - already synced")
-            processTypesSequentially(
-                types: types, typeIndex: typeIndex + 1, fullExport: fullExport,
-                endpoint: endpoint, credential: credential, isBackground: isBackground,
-                completion: completion
-            )
-            return
-        }
-        
-        updateCurrentTypeIndex(typeIndex)
-        
-        processTypeStreaming(
-            type: type, fullExport: fullExport, endpoint: endpoint, credential: credential,
-            chunkLimit: isBackground ? backgroundChunkSize : recordsPerChunk
-        ) { [weak self] success in
+        // Phase 1: Fetch one chunk from each type (no network yet)
+        fetchTypesInRound(
+            types: incompleteTypes, index: 0, fullExport: fullExport,
+            chunkLimit: perTypeLimit, rrState: rrState, accumulated: []
+        ) { [weak self] success, results in
             guard let self = self else { completion(false); return }
+            if !success { completion(false); return }
             
-            if success {
-                self.processTypesSequentially(
-                    types: types, typeIndex: typeIndex + 1, fullExport: fullExport,
-                    endpoint: endpoint, credential: credential, isBackground: isBackground,
-                    completion: completion
-                )
-            } else {
-                self.logMessage("Sync paused at \(self.shortTypeName(type.identifier)), will resume later")
-                completion(false)
+            // Update cursors for types that aren't done
+            for result in results where !result.isDone {
+                if fullExport {
+                    rrState.olderThanCursors[result.type.identifier] = result.nextOlderThan
+                } else if let anchor = result.newAnchor {
+                    rrState.anchorCursors[result.type.identifier] = anchor
+                }
             }
-        }
-    }
-    
-    private func processTypeStreaming(
-        type: HKSampleType, fullExport: Bool, endpoint: URL, credential: String,
-        chunkLimit: Int, completion: @escaping (Bool) -> Void
-    ) {
-        if fullExport {
-            logMessage("\(shortTypeName(type.identifier)): querying (newest first)...")
-            processTypeNewestFirst(
-                type: type, olderThan: nil, endpoint: endpoint,
-                credential: credential, chunkLimit: chunkLimit
-            ) { [weak self] success in
-                guard let self = self else { completion(false); return }
-                if success {
-                    self.captureCurrentAnchor(for: type) { anchor in
-                        var anchorData: Data? = nil
-                        if let anchor = anchor {
-                            anchorData = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true)
-                        }
-                        self.updateTypeProgress(typeIdentifier: type.identifier, sentInChunk: 0, isComplete: true, anchorData: anchorData)
-                        self.logMessage("  \(self.shortTypeName(type.identifier)): complete (anchor captured)")
-                        completion(true)
+            
+            // Mark empty/done types (no data to send) as complete immediately
+            let emptyDone = results.filter { $0.samples.isEmpty && $0.isDone }
+            for result in emptyDone {
+                if !fullExport {
+                    self.updateTypeProgress(typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: true, anchorData: nil)
+                }
+                rrState.completedTypes.insert(result.type.identifier)
+            }
+            
+            // Phase 2: Build combined payload from all types that returned data
+            let withData = results.filter { !$0.samples.isEmpty }
+            let allSamples = withData.flatMap { $0.samples }
+            
+            let doneTypesForAnchorCapture = results.filter { $0.isDone }.map { $0.type }
+            
+            if allSamples.isEmpty {
+                if fullExport && !doneTypesForAnchorCapture.isEmpty {
+                    self.captureAnchorsForDoneTypes(types: doneTypesForAnchorCapture, index: 0, rrState: rrState) {
+                        self.processNextRound(
+                            types: types, fullExport: fullExport, endpoint: endpoint,
+                            chunkLimit: chunkLimit, rrState: rrState,
+                            completion: completion
+                        )
                     }
                 } else {
-                    completion(false)
+                    self.processNextRound(
+                        types: types, fullExport: fullExport, endpoint: endpoint,
+                        chunkLimit: chunkLimit, rrState: rrState,
+                        completion: completion
+                    )
+                }
+                return
+            }
+            
+            guard let freshCredential = self.authCredential else {
+                self.logMessage("No auth credential available for upload")
+                completion(false)
+                return
+            }
+            
+            let payload = self.serializeCombinedStreaming(samples: allSamples)
+            
+            self.enqueueCombinedUpload(
+                payload: payload, anchors: [:], endpoint: endpoint,
+                credential: freshCredential, wasFullExport: false
+            ) { [weak self] sendSuccess in
+                guard let self = self else { completion(false); return }
+                if !sendSuccess { completion(false); return }
+                
+                // Phase 3: Update progress for all types that had data
+                for result in withData {
+                    if fullExport {
+                        self.updateTypeProgress(
+                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                            isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
+                        )
+                    } else {
+                        self.updateTypeProgress(
+                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                            isComplete: result.isDone, anchorData: result.anchorData
+                        )
+                        if result.isDone {
+                            rrState.completedTypes.insert(result.type.identifier)
+                        }
+                    }
+                }
+                
+                // Phase 4: For full export, capture anchors for done types
+                let fullExportDone = withData.filter { $0.isDone }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
+                if fullExport && !fullExportDone.isEmpty {
+                    self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) {
+                        self.processNextRound(
+                            types: types, fullExport: fullExport, endpoint: endpoint,
+                            chunkLimit: chunkLimit, rrState: rrState,
+                            completion: completion
+                        )
+                    }
+                } else {
+                    self.processNextRound(
+                        types: types, fullExport: fullExport, endpoint: endpoint,
+                        chunkLimit: chunkLimit, rrState: rrState,
+                        completion: completion
+                    )
                 }
             }
+        }
+    }
+    
+    // MARK: - Fetch all types in a round (no network, accumulates results)
+    
+    private func fetchTypesInRound(
+        types: [HKSampleType], index: Int, fullExport: Bool,
+        chunkLimit: Int, rrState: RoundRobinState,
+        accumulated: [TypeRoundResult],
+        completion: @escaping (Bool, [TypeRoundResult]) -> Void
+    ) {
+        guard index < types.count else {
+            completion(true, accumulated)
             return
         }
         
-        let anchor = loadAnchor(for: type)
-        logMessage("\(shortTypeName(type.identifier)): querying...")
+        let type = types[index]
         
-        let syncPredicate: NSPredicate? = {
-            guard let start = syncStartDate() else { return nil }
-            return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
-        }()
-        let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: chunkLimit) {
-            [weak self] _, samplesOrNil, deletedObjects, newAnchor, error in
-            autoreleasepool {
-                guard let self = self else { completion(false); return }
+        if fullExport {
+            let cursor = rrState.olderThanCursors[type.identifier]
+            fetchOneChunkNewestFirst(type: type, olderThan: cursor, chunkLimit: chunkLimit) {
+                [weak self] success, samples, nextOlderThan, isDone in
+                guard let self = self else { completion(false, accumulated); return }
+                if !success { completion(false, accumulated); return }
                 
-                self.syncLock.lock()
-                let cancelled = self.syncCancelled
-                self.syncLock.unlock()
-                if cancelled { completion(false); return }
+                let result = TypeRoundResult(
+                    type: type, samples: samples, count: samples.count,
+                    nextOlderThan: nextOlderThan, newAnchor: nil, anchorData: nil, isDone: isDone
+                )
+                self.fetchTypesInRound(
+                    types: types, index: index + 1, fullExport: fullExport,
+                    chunkLimit: chunkLimit, rrState: rrState,
+                    accumulated: accumulated + [result], completion: completion
+                )
+            }
+        } else {
+            let anchor = rrState.anchorCursors[type.identifier]
+            fetchOneChunkIncremental(type: type, anchor: anchor, chunkLimit: chunkLimit) {
+                [weak self] success, samples, newAnchor, anchorData, isDone in
+                guard let self = self else { completion(false, accumulated); return }
+                if !success { completion(false, accumulated); return }
                 
-                if let error = error {
-                    if self.isProtectedDataError(error) {
-                        self.logMessage("\(self.shortTypeName(type.identifier)): protected data inaccessible - pausing sync")
-                        self.pendingSyncAfterUnlock = true
-                        completion(false)
-                        return
-                    }
-                    self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
-                    self.updateTypeProgress(typeIdentifier: type.identifier, sentInChunk: 0, isComplete: true, anchorData: nil)
-                    completion(true)
-                    return
-                }
-                
-                let samples = samplesOrNil ?? []
-                if samples.isEmpty {
-                    self.logMessage("  \(self.shortTypeName(type.identifier)): complete")
-                    self.updateTypeProgress(typeIdentifier: type.identifier, sentInChunk: 0, isComplete: true, anchorData: nil)
-                    completion(true)
-                    return
-                }
-                
-                self.logMessage("  \(self.shortTypeName(type.identifier)): \(samples.count) samples")
-                let payload = self.serializeCombinedStreaming(samples: samples)
-                
-                var anchorData: Data? = nil
-                if let newAnchor = newAnchor {
-                    anchorData = try? NSKeyedArchiver.archivedData(withRootObject: newAnchor, requiringSecureCoding: true)
-                }
-                
-                let isLastChunk = samples.count < chunkLimit
-                
-                self.sendChunkStreaming(
-                    payload: payload, typeIdentifier: type.identifier, sampleCount: samples.count,
-                    anchorData: anchorData, isLastChunk: isLastChunk, endpoint: endpoint, credential: credential
-                ) { [weak self] success in
-                    guard let self = self else { completion(false); return }
-                    if success {
-                        if isLastChunk {
-                            completion(true)
-                        } else {
-                            self.processTypeStreamingContinue(
-                                type: type, anchor: newAnchor, endpoint: endpoint,
-                                credential: credential, chunkLimit: chunkLimit, completion: completion
-                            )
-                        }
-                    } else {
-                        completion(false)
-                    }
-                }
+                let result = TypeRoundResult(
+                    type: type, samples: samples, count: samples.count,
+                    nextOlderThan: nil, newAnchor: newAnchor, anchorData: anchorData, isDone: isDone
+                )
+                self.fetchTypesInRound(
+                    types: types, index: index + 1, fullExport: fullExport,
+                    chunkLimit: chunkLimit, rrState: rrState,
+                    accumulated: accumulated + [result], completion: completion
+                )
             }
         }
-        
-        healthStore.execute(query)
     }
     
-    // MARK: - Newest-First Full Export (HKSampleQuery sorted descending)
+    // MARK: - Capture anchors for completed full-export types
     
-    private func processTypeNewestFirst(
-        type: HKSampleType, olderThan: Date?, endpoint: URL, credential: String,
-        chunkLimit: Int, completion: @escaping (Bool) -> Void
+    private func captureAnchorsForDoneTypes(
+        types: [HKSampleType], index: Int, rrState: RoundRobinState,
+        completion: @escaping () -> Void
+    ) {
+        guard index < types.count else {
+            completion()
+            return
+        }
+        
+        let type = types[index]
+        captureCurrentAnchor(for: type) { [weak self] anchor in
+            guard let self = self else { completion(); return }
+            var anchorData: Data? = nil
+            if let anchor = anchor {
+                anchorData = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true)
+            }
+            self.updateTypeProgress(typeIdentifier: type.identifier, sentInChunk: 0, isComplete: true, anchorData: anchorData)
+            rrState.completedTypes.insert(type.identifier)
+            self.logMessage("  \(self.shortTypeName(type.identifier)): complete (anchor captured)")
+            self.captureAnchorsForDoneTypes(types: types, index: index + 1, rrState: rrState, completion: completion)
+        }
+    }
+    
+    // MARK: - Fetch-Only Chunk Processors (no network)
+    
+    private func fetchOneChunkNewestFirst(
+        type: HKSampleType, olderThan: Date?, chunkLimit: Int,
+        completion: @escaping (_ success: Bool, _ samples: [HKSample], _ nextOlderThan: Date?, _ isDone: Bool) -> Void
     ) {
         syncLock.lock()
         let cancelled = syncCancelled
         syncLock.unlock()
-        if cancelled { completion(false); return }
+        if cancelled { completion(false, [], nil, false); return }
         
         let startDate = syncStartDate()
         var predicate: NSPredicate? = nil
@@ -774,57 +878,88 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let query = HKSampleQuery(sampleType: type, predicate: predicate, limit: chunkLimit, sortDescriptors: [sortDescriptor]) {
             [weak self] _, samplesOrNil, error in
             autoreleasepool {
-                guard let self = self else { completion(false); return }
+                guard let self = self else { completion(false, [], nil, false); return }
                 
                 self.syncLock.lock()
                 let cancelled = self.syncCancelled
                 self.syncLock.unlock()
-                if cancelled { completion(false); return }
+                if cancelled { completion(false, [], nil, false); return }
                 
                 if let error = error {
                     if self.isProtectedDataError(error) {
                         self.logMessage("\(self.shortTypeName(type.identifier)): protected data inaccessible - pausing sync")
                         self.pendingSyncAfterUnlock = true
-                        completion(false)
+                        completion(false, [], nil, false)
                         return
                     }
                     self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
-                    self.updateTypeProgress(typeIdentifier: type.identifier, sentInChunk: 0, isComplete: true, anchorData: nil)
-                    completion(true)
+                    completion(true, [], nil, true)
                     return
                 }
                 
                 let samples = samplesOrNil ?? []
                 if samples.isEmpty {
                     self.logMessage("  \(self.shortTypeName(type.identifier)): all data sent (newest first)")
-                    completion(true)
+                    completion(true, [], nil, true)
                     return
                 }
                 
+                let isLastChunk = samples.count < chunkLimit
+                let nextOlderThan = isLastChunk ? nil : samples.last!.endDate
                 self.logMessage("  \(self.shortTypeName(type.identifier)): \(samples.count) samples (newest first)")
-                let payload = self.serializeCombinedStreaming(samples: samples)
+                completion(true, samples, nextOlderThan, isLastChunk)
+            }
+        }
+        
+        healthStore.execute(query)
+    }
+    
+    private func fetchOneChunkIncremental(
+        type: HKSampleType, anchor: HKQueryAnchor?, chunkLimit: Int,
+        completion: @escaping (_ success: Bool, _ samples: [HKSample], _ newAnchor: HKQueryAnchor?, _ anchorData: Data?, _ isDone: Bool) -> Void
+    ) {
+        let syncPredicate: NSPredicate? = {
+            guard let start = syncStartDate() else { return nil }
+            return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
+        }()
+        
+        let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: chunkLimit) {
+            [weak self] _, samplesOrNil, deletedObjects, newAnchor, error in
+            autoreleasepool {
+                guard let self = self else { completion(false, [], nil, nil, false); return }
+                
+                self.syncLock.lock()
+                let cancelled = self.syncCancelled
+                self.syncLock.unlock()
+                if cancelled { completion(false, [], nil, nil, false); return }
+                
+                if let error = error {
+                    if self.isProtectedDataError(error) {
+                        self.logMessage("\(self.shortTypeName(type.identifier)): protected data inaccessible - pausing sync")
+                        self.pendingSyncAfterUnlock = true
+                        completion(false, [], nil, nil, false)
+                        return
+                    }
+                    self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
+                    completion(true, [], nil, nil, true)
+                    return
+                }
+                
+                let samples = samplesOrNil ?? []
+                if samples.isEmpty {
+                    self.logMessage("  \(self.shortTypeName(type.identifier)): complete")
+                    completion(true, [], nil, nil, true)
+                    return
+                }
+                
+                var anchorData: Data? = nil
+                if let newAnchor = newAnchor {
+                    anchorData = try? NSKeyedArchiver.archivedData(withRootObject: newAnchor, requiringSecureCoding: true)
+                }
                 
                 let isLastChunk = samples.count < chunkLimit
-                
-                self.sendChunkStreaming(
-                    payload: payload, typeIdentifier: type.identifier, sampleCount: samples.count,
-                    anchorData: nil, isLastChunk: false, endpoint: endpoint, credential: credential
-                ) { [weak self] success in
-                    guard let self = self else { completion(false); return }
-                    if success {
-                        if isLastChunk {
-                            completion(true)
-                        } else {
-                            let oldestEndDate = samples.last!.endDate
-                            self.processTypeNewestFirst(
-                                type: type, olderThan: oldestEndDate, endpoint: endpoint,
-                                credential: credential, chunkLimit: chunkLimit, completion: completion
-                            )
-                        }
-                    } else {
-                        completion(false)
-                    }
-                }
+                self.logMessage("  \(self.shortTypeName(type.identifier)): \(samples.count) samples")
+                completion(true, samples, newAnchor, anchorData, isLastChunk)
             }
         }
         
@@ -834,7 +969,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // MARK: - Anchor Capture (for incremental sync after full export)
     
     private func captureCurrentAnchor(for type: HKSampleType, completion: @escaping (HKQueryAnchor?) -> Void) {
-        logMessage("  \(shortTypeName(type.identifier)): capturing anchor for future incremental sync...")
+        logMessage("  \(shortTypeName(type.identifier)): saving anchor...")
         captureAnchorStep(type: type, anchor: nil, limit: 10000, completion: completion)
     }
     
@@ -856,97 +991,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         healthStore.execute(query)
     }
     
-    private func processTypeStreamingContinue(
-        type: HKSampleType, anchor: HKQueryAnchor?, endpoint: URL,
-        credential: String, chunkLimit: Int, completion: @escaping (Bool) -> Void
-    ) {
-        let syncPredicate: NSPredicate? = {
-            guard let start = syncStartDate() else { return nil }
-            return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
-        }()
-        let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: chunkLimit) {
-            [weak self] _, samplesOrNil, deletedObjects, newAnchor, error in
-            autoreleasepool {
-                guard let self = self else { completion(false); return }
-                
-                self.syncLock.lock()
-                let cancelled = self.syncCancelled
-                self.syncLock.unlock()
-                if cancelled { completion(false); return }
-                
-                if let error = error {
-                    if self.isProtectedDataError(error) {
-                        self.logMessage("\(self.shortTypeName(type.identifier)): protected data inaccessible - pausing sync")
-                        self.pendingSyncAfterUnlock = true
-                        completion(false)
-                        return
-                    }
-                    self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
-                    self.updateTypeProgress(typeIdentifier: type.identifier, sentInChunk: 0, isComplete: true, anchorData: nil)
-                    completion(true)
-                    return
-                }
-                
-                let samples = samplesOrNil ?? []
-                if samples.isEmpty {
-                    self.updateTypeProgress(typeIdentifier: type.identifier, sentInChunk: 0, isComplete: true, anchorData: nil)
-                    completion(true)
-                    return
-                }
-                
-                self.logMessage("  \(self.shortTypeName(type.identifier)): +\(samples.count) samples")
-                let payload = self.serializeCombinedStreaming(samples: samples)
-                
-                var anchorData: Data? = nil
-                if let newAnchor = newAnchor {
-                    anchorData = try? NSKeyedArchiver.archivedData(withRootObject: newAnchor, requiringSecureCoding: true)
-                }
-                
-                let isLastChunk = samples.count < chunkLimit
-                
-                self.sendChunkStreaming(
-                    payload: payload, typeIdentifier: type.identifier, sampleCount: samples.count,
-                    anchorData: anchorData, isLastChunk: isLastChunk, endpoint: endpoint, credential: credential
-                ) { [weak self] success in
-                    guard let self = self else { completion(false); return }
-                    if success {
-                        if isLastChunk {
-                            completion(true)
-                        } else {
-                            self.processTypeStreamingContinue(
-                                type: type, anchor: newAnchor, endpoint: endpoint,
-                                credential: credential, chunkLimit: chunkLimit, completion: completion
-                            )
-                        }
-                    } else {
-                        completion(false)
-                    }
-                }
-            }
-        }
-        
-        healthStore.execute(query)
-    }
-    
-    private func sendChunkStreaming(
-        payload: [String: Any], typeIdentifier: String, sampleCount: Int,
-        anchorData: Data?, isLastChunk: Bool, endpoint: URL, credential: String,
-        completion: @escaping (Bool) -> Void
-    ) {
-        enqueueCombinedUpload(
-            payload: payload, anchors: [:], endpoint: endpoint,
-            credential: credential, wasFullExport: false
-        ) { [weak self] success in
-            guard let self = self else { completion(false); return }
-            if success {
-                self.updateTypeProgress(
-                    typeIdentifier: typeIdentifier, sentInChunk: sampleCount,
-                    isComplete: isLastChunk, anchorData: isLastChunk ? anchorData : nil
-                )
-            }
-            completion(success)
-        }
-    }
     
     private func finishSync() {
         syncLock.lock()
@@ -1053,7 +1097,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         guard let refreshToken = self.refreshToken, let base = self.apiBaseUrl else {
             tokenRefreshLock.unlock()
-            logMessage("No refresh token or host - cannot refresh")
+            logMessage("Token refresh failed: no credentials")
             completion(false)
             return
         }
@@ -1063,12 +1107,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         tokenRefreshLock.unlock()
         
         guard let url = URL(string: "\(base)/token/refresh") else {
-            logMessage("Invalid refresh URL")
+            logMessage("Token refresh failed: invalid URL")
             finishTokenRefresh(success: false)
             return
         }
-        
-        logMessage("Attempting token refresh...")
         
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -1076,7 +1118,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         let body: [String: String] = ["refresh_token": refreshToken]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
-            logMessage("Failed to serialize refresh request body")
+            logMessage("Token refresh failed: serialization error")
             finishTokenRefresh(success: false)
             return
         }
@@ -1091,10 +1133,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 return
             }
             
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            
             guard let httpResponse = response as? HTTPURLResponse,
                   (200...299).contains(httpResponse.statusCode),
                   let data = data else {
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
                 self.logMessage("Token refresh failed: HTTP \(statusCode)")
                 self.finishTokenRefresh(success: false)
                 return
@@ -1102,15 +1145,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let newAccessToken = json["access_token"] as? String else {
-                self.logMessage("Token refresh: invalid response body")
+                self.logMessage("Token refresh failed: invalid response body")
                 self.finishTokenRefresh(success: false)
                 return
             }
             
             let newRefreshToken = json["refresh_token"] as? String
             OpenWearablesHealthSdkKeychain.updateTokens(accessToken: newAccessToken, refreshToken: newRefreshToken)
-            
-            self.logMessage("Token refreshed successfully")
+            self.logMessage("Token refresh: HTTP \(statusCode)")
             self.finishTokenRefresh(success: true)
         }
         
