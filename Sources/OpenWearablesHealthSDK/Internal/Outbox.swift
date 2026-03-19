@@ -219,18 +219,21 @@ extension OpenWearablesHealthSDK {
         completion: @escaping (Bool) -> Void
     ) {
         if isApiKeyAuth {
-            self.logMessage("401 with API key - emitting auth error")
+            self.logMessage("Got 401 with apiKey auth")
             self.emitAuthError(statusCode: 401)
             try? FileManager.default.removeItem(atPath: payloadPath)
             completion(false)
             return
         }
         
+        self.logMessage("Got 401, refreshing token...")
+        
         self.attemptTokenRefresh { [weak self] refreshSuccess in
             guard let self = self else { return }
             
             if refreshSuccess, let newCredential = self.authCredential {
-                self.logMessage("Retrying upload with refreshed token...")
+                self.logMessage("Token refreshed, retrying...")
+                
                 var retryReq = URLRequest(url: endpoint)
                 retryReq.httpMethod = "POST"
                 retryReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -242,14 +245,14 @@ extension OpenWearablesHealthSDK {
                     guard let self = self else { return }
                     
                     if let retryError = retryError {
-                        self.logMessage("Retry upload error: \(retryError.localizedDescription)")
+                        self.logMessage("Retry failed: \(retryError.localizedDescription)")
                         try? FileManager.default.removeItem(atPath: payloadPath)
                         completion(false)
                         return
                     }
                     
                     if let retryHttp = retryResponse as? HTTPURLResponse, (200...299).contains(retryHttp.statusCode) {
-                        self.logMessage("Retry HTTP \(retryHttp.statusCode)")
+                        self.logMessage("Retry: HTTP \(retryHttp.statusCode)")
                         self.handleSuccessfulUpload(itemPath: itemPath, anchorPath: anchorsPath, wasFullExport: wasFullExport)
                         try? FileManager.default.removeItem(atPath: payloadPath)
                         completion(true)
@@ -263,6 +266,7 @@ extension OpenWearablesHealthSDK {
                 }
                 retryTask.resume()
             } else {
+                self.logMessage("Token refresh failed")
                 self.emitAuthError(statusCode: 401)
                 try? FileManager.default.removeItem(atPath: payloadPath)
                 completion(false)
