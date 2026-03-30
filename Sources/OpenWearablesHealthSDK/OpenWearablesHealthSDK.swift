@@ -472,9 +472,19 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         
         let readTypes = Set(getQueryableTypes())
-        logMessage("Requesting read-only auth for \(readTypes.count) types: \(readTypes)")
+        // Request write permission for bodyMass to guarantee iOS shows the
+        // authorization dialog. An empty Set() is silently ignored on some
+        // devices (e.g. iPhone 11 Pro, iOS 26.3).
+        let writeTypes: Set<HKSampleType> = Set(
+            [HKQuantityType.quantityType(forIdentifier: .bodyMass)].compactMap { $0 }
+        )
+        logMessage("Requesting auth for \(readTypes.count) read types, \(writeTypes.count) write types")
 
-        healthStore.requestAuthorization(toShare: Set(), read: readTypes) { ok, _ in
+        healthStore.requestAuthorization(toShare: writeTypes, read: readTypes) { ok, error in
+            if let error = error {
+                self.logMessage("Authorization error: \(error.localizedDescription)")
+            }
+            self.logMessage("Authorization result: \(ok)")
             DispatchQueue.main.async { completion(ok) }
         }
     }
