@@ -15,6 +15,17 @@ import Network
     case debug = 2
 }
 
+/// Distinguishes a genuine authentication failure from a transient network error
+/// during token refresh so callers can decide whether to sign the user out.
+internal enum TokenRefreshResult {
+    /// Token was refreshed successfully.
+    case success
+    /// Refresh token is invalid — the server explicitly rejected it (HTTP 401/403).
+    case authFailure
+    /// Could not reach the server (timeout, DNS, connectivity, 5xx, etc.).
+    case networkError
+}
+
 /// Main entry point for the Open Wearables Health SDK.
 /// Use `OpenWearablesHealthSDK.shared` to access the singleton instance.
 ///
@@ -30,7 +41,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.10.0"
+    internal static let sdkVersion = "0.11.0"
     
     // MARK: - Public Callbacks
     
@@ -56,7 +67,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // Token refresh state
     private var isRefreshingToken = false
     private let tokenRefreshLock = NSLock()
-    private var tokenRefreshCallbacks: [(Bool) -> Void] = []
+    private var tokenRefreshCallbacks: [(TokenRefreshResult) -> Void] = []
     
     // MARK: - Auth Helpers
     
@@ -1086,7 +1097,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     // MARK: - Token Refresh
     
-    internal func attemptTokenRefresh(completion: @escaping (Bool) -> Void) {
+    internal func attemptTokenRefresh(completion: @escaping (TokenRefreshResult) -> Void) {
         tokenRefreshLock.lock()
         
         if isRefreshingToken {
@@ -1098,7 +1109,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         guard let refreshToken = self.refreshToken, let base = self.apiBaseUrl else {
             tokenRefreshLock.unlock()
             logMessage("Token refresh failed: no credentials")
-            completion(false)
+            completion(.authFailure)
             return
         }
         
@@ -1108,7 +1119,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         guard let url = URL(string: "\(base)/token/refresh") else {
             logMessage("Token refresh failed: invalid URL")
-            finishTokenRefresh(success: false)
+            finishTokenRefresh(result: .authFailure)
             return
         }
         
@@ -1119,7 +1130,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let body: [String: String] = ["refresh_token": refreshToken]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
             logMessage("Token refresh failed: serialization error")
-            finishTokenRefresh(success: false)
+            finishTokenRefresh(result: .networkError)
             return
         }
         req.httpBody = bodyData
@@ -1129,37 +1140,43 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             
             if let error = error {
                 self.logMessage("Token refresh failed: \(error.localizedDescription)")
-                self.finishTokenRefresh(success: false)
+                self.finishTokenRefresh(result: .networkError)
                 return
             }
             
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             
+            if (401...403).contains(statusCode) {
+                self.logMessage("Token refresh rejected: HTTP \(statusCode)")
+                self.finishTokenRefresh(result: .authFailure)
+                return
+            }
+            
             guard let httpResponse = response as? HTTPURLResponse,
                   (200...299).contains(httpResponse.statusCode),
                   let data = data else {
                 self.logMessage("Token refresh failed: HTTP \(statusCode)")
-                self.finishTokenRefresh(success: false)
+                self.finishTokenRefresh(result: .networkError)
                 return
             }
             
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let newAccessToken = json["access_token"] as? String else {
                 self.logMessage("Token refresh failed: invalid response body")
-                self.finishTokenRefresh(success: false)
+                self.finishTokenRefresh(result: .networkError)
                 return
             }
             
             let newRefreshToken = json["refresh_token"] as? String
             OpenWearablesHealthSdkKeychain.updateTokens(accessToken: newAccessToken, refreshToken: newRefreshToken)
             self.logMessage("Token refresh: HTTP \(statusCode)")
-            self.finishTokenRefresh(success: true)
+            self.finishTokenRefresh(result: .success)
         }
         
         task.resume()
     }
     
-    private func finishTokenRefresh(success: Bool) {
+    private func finishTokenRefresh(result: TokenRefreshResult) {
         tokenRefreshLock.lock()
         let callbacks = tokenRefreshCallbacks
         tokenRefreshCallbacks = []
@@ -1167,7 +1184,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         tokenRefreshLock.unlock()
         
         for callback in callbacks {
-            callback(success)
+            callback(result)
         }
     }
     
