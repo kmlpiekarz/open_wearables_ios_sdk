@@ -37,15 +37,18 @@ extension OpenWearablesHealthSDK {
                         self?.emitAuthError(statusCode: 401)
                     }
                 } else {
-                    self.attemptTokenRefresh { [weak self] refreshSuccess in
+                    self.attemptTokenRefresh { [weak self] result in
                         guard let self = self else { return }
-                        if refreshSuccess {
+                        switch result {
+                        case .success:
                             self.logMessage("Token refreshed after background 401 - retrying outbox...")
                             self.retryOutboxIfPossible()
-                        } else {
+                        case .authFailure:
                             DispatchQueue.main.async { [weak self] in
                                 self?.emitAuthError(statusCode: 401)
                             }
+                        case .networkError:
+                            self.logMessage("Token refresh failed (network) after background 401 - will retry later")
                         }
                     }
                 }

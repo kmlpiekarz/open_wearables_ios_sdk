@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.0
+
+* **Smarter token refresh error handling**: token refresh failures are now classified as either `authFailure` (refresh token rejected with 401/403) or `networkError` (timeout, DNS, 5xx). Only genuine auth failures trigger user disconnect — transient network errors during refresh no longer force sign-out, allowing the SDK's retry mechanism to recover automatically.
+
 ## 0.10.0
 
 * **Combined payloads**: all health data types are now merged into a single payload per sync round instead of separate requests per type.

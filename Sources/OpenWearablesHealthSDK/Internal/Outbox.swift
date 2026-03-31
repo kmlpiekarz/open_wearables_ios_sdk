@@ -228,10 +228,17 @@ extension OpenWearablesHealthSDK {
         
         self.logMessage("Got 401, refreshing token...")
         
-        self.attemptTokenRefresh { [weak self] refreshSuccess in
+        self.attemptTokenRefresh { [weak self] result in
             guard let self = self else { return }
             
-            if refreshSuccess, let newCredential = self.authCredential {
+            switch result {
+            case .success:
+                guard let newCredential = self.authCredential else {
+                    self.logMessage("Token refreshed but no credential available")
+                    try? FileManager.default.removeItem(atPath: payloadPath)
+                    completion(false)
+                    return
+                }
                 self.logMessage("Token refreshed, retrying...")
                 
                 var retryReq = URLRequest(url: endpoint)
@@ -259,15 +266,24 @@ extension OpenWearablesHealthSDK {
                     } else {
                         let retryStatus = (retryResponse as? HTTPURLResponse)?.statusCode ?? 0
                         self.logMessage("Retry failed: HTTP \(retryStatus)")
-                        self.emitAuthError(statusCode: 401)
+                        if (401...403).contains(retryStatus) {
+                            self.emitAuthError(statusCode: retryStatus)
+                        }
                         try? FileManager.default.removeItem(atPath: payloadPath)
                         completion(false)
                     }
                 }
                 retryTask.resume()
-            } else {
-                self.logMessage("Token refresh failed")
+                
+            case .authFailure:
+                self.logMessage("Token refresh rejected - auth is invalid")
                 self.emitAuthError(statusCode: 401)
+                try? FileManager.default.removeItem(atPath: payloadPath)
+                completion(false)
+                
+            case .networkError:
+                self.logMessage("Token refresh failed (network) - will retry later")
+                self.markNetworkError()
                 try? FileManager.default.removeItem(atPath: payloadPath)
                 completion(false)
             }
