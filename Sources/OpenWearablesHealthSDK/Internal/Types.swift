@@ -855,6 +855,7 @@ extension OpenWearablesHealthSDK {
     private func _mapSource(_ sourceRevision: HKSourceRevision, device: HKDevice?) -> [String: Any] {
         var result: [String: Any] = [
             "appId": sourceRevision.source.bundleIdentifier,
+            "name": sourceRevision.source.name,
             "deviceId": NSNull(),
             "deviceName": (device?.name) as Any? ?? NSNull(),
             "deviceManufacturer": (device?.manufacturer) as Any? ?? NSNull(),
