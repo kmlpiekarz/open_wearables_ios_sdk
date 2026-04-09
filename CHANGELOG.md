@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.0
+
+* **Source device name**: added `name` field to the source object in health data payloads, providing human-readable device identification alongside existing device metadata.
+
 ## 0.11.0
 
 * **Smarter token refresh error handling**: token refresh failures are now classified as either `authFailure` (refresh token rejected with 401/403) or `networkError` (timeout, DNS, 5xx). Only genuine auth failures trigger user disconnect — transient network errors during refresh no longer force sign-out, allowing the SDK's retry mechanism to recover automatically.
