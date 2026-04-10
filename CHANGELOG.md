@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.0
+
+* **Sync telemetry**: new `/logs` endpoint integration for initial full sync diagnostics.
+  - `historical_data_sync_start` event sent before the first payload with per-type record counts, time range, and device state.
+  - `historical_data_type_sync_end` event sent per data type as each completes (fire-and-forget), with record count, duration, success status, and device state snapshot.
+  - Device state includes battery level/state, thermal state, low power mode, RAM usage, and foreground/background task type.
+  - Types with zero records are excluded from end events.
+  - Start event is sent for both fresh and resumed full exports.
+
 ## 0.12.0
 
 * **Source device name**: added `name` field to the source object in health data payloads, providing human-readable device identification alongside existing device metadata.

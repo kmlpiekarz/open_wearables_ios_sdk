@@ -41,7 +41,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.12.0"
+    internal static let sdkVersion = "0.13.0"
     
     // MARK: - Public Callbacks
     
@@ -122,6 +122,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private var isSyncing: Bool = false
     private var syncCancelled: Bool = false
     private let syncLock = NSLock()
+    internal var fullSyncStartTime: Date?
     
     // Network monitoring
     private var networkMonitor: NWPathMonitor?
@@ -588,20 +589,57 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             _ = startNewSyncState(fullExport: effectiveFullExport, types: queryableTypes)
         }
         
-        processTypesRoundRobin(
-            types: queryableTypes,
-            fullExport: effectiveFullExport,
-            endpoint: endpoint,
-            isBackground: isBackground
-        ) { [weak self] allTypesCompleted in
+        let syncStartTime = Date()
+        
+        let startRoundRobin: () -> Void = { [weak self] in
             guard let self = self else { return }
-            if allTypesCompleted {
-                self.finalizeSyncState()
-            } else {
-                self.logMessage("Sync incomplete - will resume remaining types later")
+            if effectiveFullExport {
+                self.fullSyncStartTime = syncStartTime
             }
-            self.finishSync()
-            completion()
+            self.processTypesRoundRobin(
+                types: queryableTypes,
+                fullExport: effectiveFullExport,
+                endpoint: endpoint,
+                isBackground: isBackground
+            ) { [weak self] allTypesCompleted in
+                guard let self = self else { return }
+                
+                if effectiveFullExport && !allTypesCompleted {
+                    let durationMs = Int(Date().timeIntervalSince(syncStartTime) * 1000)
+                    let state = self.loadSyncState()
+                    for type in queryableTypes {
+                        let typeId = type.identifier
+                        if !(state?.completedTypes.contains(typeId) ?? false) {
+                            let recordCount = state?.typeProgress[typeId]?.sentCount ?? 0
+                            if recordCount > 0 {
+                                self.sendTypeEndLog(type: typeId, success: false, recordCount: recordCount, durationMs: durationMs)
+                            }
+                        }
+                    }
+                }
+                
+                if allTypesCompleted {
+                    self.finalizeSyncState()
+                } else {
+                    self.logMessage("Sync incomplete - will resume remaining types later")
+                }
+                self.fullSyncStartTime = nil
+                self.finishSync()
+                completion()
+            }
+        }
+        
+        if effectiveFullExport {
+            let startDate = syncStartDate()
+            let endDate = Date()
+            countSamplesForTypes(queryableTypes, startDate: startDate, endDate: endDate) { [weak self] counts in
+                guard let self = self else { return }
+                self.sendSyncStartLog(types: queryableTypes, typeCounts: counts, startDate: startDate, endDate: endDate) {
+                    startRoundRobin()
+                }
+            }
+        } else {
+            startRoundRobin()
         }
     }
     
@@ -707,6 +745,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                     self.updateTypeProgress(typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: true, anchorData: nil)
                 }
                 rrState.completedTypes.insert(result.type.identifier)
+                if fullExport { self.fireTypeCompletedLog(result.type.identifier) }
             }
             
             // Phase 2: Build combined payload from all types that returned data
@@ -860,6 +899,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
             self.updateTypeProgress(typeIdentifier: type.identifier, sentInChunk: 0, isComplete: true, anchorData: anchorData)
             rrState.completedTypes.insert(type.identifier)
+            self.fireTypeCompletedLog(type.identifier)
             self.logMessage("  \(self.shortTypeName(type.identifier)): complete (anchor captured)")
             self.captureAnchorsForDoneTypes(types: types, index: index + 1, rrState: rrState, completion: completion)
         }
