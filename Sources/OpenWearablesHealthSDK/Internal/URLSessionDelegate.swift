@@ -14,17 +14,25 @@ extension OpenWearablesHealthSDK {
             backgroundDataBuffer.removeValue(forKey: task.taskIdentifier)
         }
 
-        if let error = error {
-            let nsError = error as NSError
-            if nsError.code != NSURLErrorCancelled {
-                NSLog("[OpenWearablesHealthSDK] background upload failed: \(error.localizedDescription) - will retry later")
-            }
+        let statusCode = (task.response as? HTTPURLResponse)?.statusCode
+
+        logUploadOutcome(
+            stage: "outbox-retry",
+            requestId: task.originalRequest?.value(forHTTPHeaderField: "X-Request-Id") ?? "unknown",
+            declaredBytes: Int(task.countOfBytesExpectedToSend),
+            task: task,
+            statusCode: statusCode,
+            error: error
+        )
+
+        if error != nil {
+            // Files are kept: the next retry pass picks the item up again.
             return
         }
 
-        let statusCode = (task.response as? HTTPURLResponse)?.statusCode ?? 0
+        let status = statusCode ?? 0
 
-        if (200...299).contains(statusCode) {
+        if (200...299).contains(status) {
             if !itemPath.isEmpty,
                let itemData = try? Data(contentsOf: URL(fileURLWithPath: itemPath)),
                let item = try? JSONDecoder().decode(OutboxItem.self, from: itemData) {
@@ -40,7 +48,7 @@ extension OpenWearablesHealthSDK {
             return
         }
 
-        if statusCode == 401 {
+        if status == 401 {
             // Keep the files - after a successful token refresh the retry pass
             // picks them up again.
             if isApiKeyAuth {
@@ -67,8 +75,8 @@ extension OpenWearablesHealthSDK {
             return
         }
 
-        if (400...499).contains(statusCode) {
-            NSLog("[OpenWearablesHealthSDK] background upload rejected (HTTP \(statusCode)) - dropping item")
+        if (400...499).contains(status) {
+            logDiagnostic("Outbox item rejected (HTTP \(status)) - dropping it")
             if !payloadPath.isEmpty { try? FileManager.default.removeItem(atPath: payloadPath) }
             if !anchorPath.isEmpty { try? FileManager.default.removeItem(atPath: anchorPath) }
             if !itemPath.isEmpty { try? FileManager.default.removeItem(atPath: itemPath) }
@@ -76,7 +84,6 @@ extension OpenWearablesHealthSDK {
         }
 
         // 5xx / no response: keep the files for a later retry pass.
-        NSLog("[OpenWearablesHealthSDK] background upload failed (HTTP \(statusCode)) - will retry later")
     }
 
     public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {

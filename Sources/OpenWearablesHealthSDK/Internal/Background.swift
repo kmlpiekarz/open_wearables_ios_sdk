@@ -103,7 +103,7 @@ extension OpenWearablesHealthSDK {
 
         task.expirationHandler = {
             self.logMessage("BGAppRefresh task expired - cancelling in-flight uploads")
-            self.cancelInFlightForegroundUploads()
+            self.cancelInFlightSyncUploads(reason: "backgroundExpiration")
             op.cancel()
         }
         op.completionBlock = { task.setTaskCompleted(success: !op.isCancelled) }
@@ -132,7 +132,7 @@ extension OpenWearablesHealthSDK {
 
         task.expirationHandler = {
             self.logMessage("BGProcessing task expired - cancelling in-flight uploads")
-            self.cancelInFlightForegroundUploads()
+            self.cancelInFlightSyncUploads(reason: "backgroundExpiration")
             op.cancel()
         }
         op.completionBlock = { task.setTaskCompleted(success: !op.isCancelled) }

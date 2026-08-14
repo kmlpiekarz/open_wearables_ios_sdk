@@ -27,147 +27,97 @@ extension OpenWearablesHealthSDK {
     }
 
     // MARK: - Combined upload
-    internal func enqueueCombinedUpload(
+    
+    /// Uploads one combined sync round.
+    ///
+    /// Nothing is written to the outbox. Progress lives in `SyncState` and advances
+    /// only on a 2xx, so an interrupted round is rebuilt from HealthKit by the next
+    /// sync. A persisted copy could only ever be replayed as a duplicate of data that
+    /// the next sync re-fetches anyway, while `SyncState` knew nothing about it.
+    internal func uploadCombinedPayload(
         payload: [String: Any],
-        anchors: [String: HKQueryAnchor],
         endpoint: URL,
         credential: String,
-        wasFullExport: Bool = false,
         completion: @escaping (Bool) -> Void
     ) {
-        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+        guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
             self.logMessage("Failed to serialize payload")
             completion(false)
             return
         }
         
-        let id = UUID().uuidString
-        let payloadURL = newPath("combined_payload_\(id)", ext: "json")
-        
-        do {
-            try data.write(to: payloadURL, options: Data.WritingOptions.atomic)
-        } catch {
-            self.logMessage("Failed to write payload: \(error.localizedDescription)")
-            completion(false)
-            return
-        }
-
-        var anchorsURL: URL? = nil
-        if !anchors.isEmpty {
-            var anchorsData: [String: Data] = [:]
-            for (typeId, anchor) in anchors {
-                if let data = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true) {
-                    anchorsData[typeId] = data
-                }
-            }
-            
-            if let serializedData = try? NSKeyedArchiver.archivedData(withRootObject: anchorsData, requiringSecureCoding: true) {
-                let u = newPath("combined_anchors_\(id)", ext: "bin")
-                try? serializedData.write(to: u, options: Data.WritingOptions.atomic)
-                anchorsURL = u
-            }
-        }
-
-        let item = OutboxItem(
-            typeIdentifier: "combined",
-            userKey: userKey(),
-            payloadPath: payloadURL.path,
-            anchorPath: anchorsURL?.path,
-            wasFullExport: wasFullExport
-        )
-        let itemURL = newPath("combined_item_\(id)", ext: "json")
-        if let md = try? JSONEncoder().encode(item) {
-            try? md.write(to: itemURL, options: Data.WritingOptions.atomic)
-        }
-
-        guard let payloadData = try? Data(contentsOf: payloadURL) else {
-            self.logMessage("Failed to read payload")
-            completion(false)
-            return
-        }
-        
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        applyAuth(to: &req, credential: credential)
+        let requestId = UUID().uuidString
+        var req = buildRequest(url: endpoint, credential: credential, requestId: requestId)
         req.httpBody = payloadData
-        req.setValue("\(payloadData.count)", forHTTPHeaderField: "Content-Length")
         
         self.logPayloadSummary(payloadData, label: "Sending")
-
+        
         let task = foregroundSession.dataTask(with: req) { [weak self] data, response, error in
             guard let self = self else { return }
             
-            if let error = error {
-                let nsError = error as NSError
-                if nsError.code != NSURLErrorCancelled {
-                    self.logMessage("Upload error: \(error.localizedDescription)")
-                    self.markNetworkError()
-                }
-                try? FileManager.default.removeItem(atPath: payloadURL.path)
+            let completedTask = self.untrackSyncUpload(requestId: requestId)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode
+            self.logUploadOutcome(
+                stage: "sync", requestId: requestId, declaredBytes: payloadData.count,
+                task: completedTask, statusCode: statusCode, error: error
+            )
+            
+            if error != nil {
+                self.markNetworkError()
                 completion(false)
                 return
             }
             
-            if let httpResponse = response as? HTTPURLResponse {
-                if (200...299).contains(httpResponse.statusCode) {
-                    self.logMessage("HTTP \(httpResponse.statusCode)")
-                    
-                    self.handleSuccessfulUpload(itemPath: itemURL.path, anchorPath: anchorsURL?.path, wasFullExport: wasFullExport)
-                    
-                    try? FileManager.default.removeItem(atPath: payloadURL.path)
-                    completion(true)
-                } else if httpResponse.statusCode == 401 {
-                    self.handle401ForUpload(
-                        payloadData: payloadData,
-                        endpoint: endpoint,
-                        itemPath: itemURL.path,
-                        payloadPath: payloadURL.path,
-                        anchorsPath: anchorsURL?.path,
-                        wasFullExport: wasFullExport,
-                        completion: completion
-                    )
-                } else {
-                    var errorMsg = "HTTP \(httpResponse.statusCode)"
-                    if let data = data, let errorBody = String(data: data, encoding: .utf8) {
-                        let truncated = errorBody.count > 200 ? String(errorBody.prefix(200)) + "..." : errorBody
-                        errorMsg += " - \(truncated)"
-                    }
-                    self.logMessage(errorMsg)
-                    try? FileManager.default.removeItem(atPath: payloadURL.path)
-                    
-                    if (400...499).contains(httpResponse.statusCode) {
-                        self.logMessage("Skipping chunk due to \(httpResponse.statusCode) - continuing sync")
-                        completion(true)
-                    } else {
-                        completion(false)
-                    }
-                }
-            } else {
+            guard let statusCode = statusCode else {
                 self.logMessage("No HTTP response")
                 self.markNetworkError()
-                try? FileManager.default.removeItem(atPath: payloadURL.path)
+                completion(false)
+                return
+            }
+            
+            if (200...299).contains(statusCode) {
+                completion(true)
+                return
+            }
+            
+            if statusCode == 401 {
+                self.handle401ForUpload(
+                    payloadData: payloadData,
+                    endpoint: endpoint,
+                    requestId: requestId,
+                    completion: completion
+                )
+                return
+            }
+            
+            if let data = data, let errorBody = String(data: data, encoding: .utf8), !errorBody.isEmpty {
+                let truncated = errorBody.count > 200 ? String(errorBody.prefix(200)) + "..." : errorBody
+                self.logDiagnostic("HTTP \(statusCode) - \(truncated)")
+            }
+            
+            if (400...499).contains(statusCode) {
+                self.logMessage("Skipping chunk due to \(statusCode) - continuing sync")
+                completion(true)
+            } else {
                 completion(false)
             }
         }
         
+        trackSyncUpload(task, requestId: requestId)
         task.resume()
     }
     
-    /// Handles 401 response for combined uploads.
+    /// Handles 401 response for combined uploads. The retry reuses `requestId` so both
+    /// attempts are one story in the server-side logs.
     private func handle401ForUpload(
         payloadData: Data,
         endpoint: URL,
-        itemPath: String,
-        payloadPath: String,
-        anchorsPath: String?,
-        wasFullExport: Bool,
+        requestId: String,
         completion: @escaping (Bool) -> Void
     ) {
         if isApiKeyAuth {
             self.logMessage("Got 401 with apiKey auth")
             self.emitAuthError(statusCode: 401)
-            try? FileManager.default.removeItem(atPath: payloadPath)
             completion(false)
             return
         }
@@ -181,56 +131,53 @@ extension OpenWearablesHealthSDK {
             case .success:
                 guard let newCredential = self.authCredential else {
                     self.logMessage("Token refreshed but no credential available")
-                    try? FileManager.default.removeItem(atPath: payloadPath)
                     completion(false)
                     return
                 }
                 self.logMessage("Token refreshed, retrying...")
                 
-                var retryReq = URLRequest(url: endpoint)
-                retryReq.httpMethod = "POST"
-                retryReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                self.applyAuth(to: &retryReq, credential: newCredential)
+                let retryKey = "\(requestId)#retry"
+                var retryReq = self.buildRequest(url: endpoint, credential: newCredential, requestId: requestId)
                 retryReq.httpBody = payloadData
-                retryReq.setValue("\(payloadData.count)", forHTTPHeaderField: "Content-Length")
                 
-                let retryTask = self.foregroundSession.dataTask(with: retryReq) { [weak self] retryData, retryResponse, retryError in
+                let retryTask = self.foregroundSession.dataTask(with: retryReq) { [weak self] _, retryResponse, retryError in
                     guard let self = self else { return }
                     
-                    if let retryError = retryError {
-                        self.logMessage("Retry failed: \(retryError.localizedDescription)")
-                        try? FileManager.default.removeItem(atPath: payloadPath)
+                    let completedTask = self.untrackSyncUpload(requestId: retryKey)
+                    let retryStatus = (retryResponse as? HTTPURLResponse)?.statusCode
+                    self.logUploadOutcome(
+                        stage: "sync-401-retry", requestId: requestId, declaredBytes: payloadData.count,
+                        task: completedTask, statusCode: retryStatus, error: retryError
+                    )
+                    
+                    if retryError != nil {
+                        self.markNetworkError()
                         completion(false)
                         return
                     }
                     
-                    if let retryHttp = retryResponse as? HTTPURLResponse, (200...299).contains(retryHttp.statusCode) {
-                        self.logMessage("Retry: HTTP \(retryHttp.statusCode)")
-                        self.handleSuccessfulUpload(itemPath: itemPath, anchorPath: anchorsPath, wasFullExport: wasFullExport)
-                        try? FileManager.default.removeItem(atPath: payloadPath)
+                    if let retryStatus = retryStatus, (200...299).contains(retryStatus) {
                         completion(true)
-                    } else {
-                        let retryStatus = (retryResponse as? HTTPURLResponse)?.statusCode ?? 0
-                        self.logMessage("Retry failed: HTTP \(retryStatus)")
-                        if (401...403).contains(retryStatus) {
-                            self.emitAuthError(statusCode: retryStatus)
-                        }
-                        try? FileManager.default.removeItem(atPath: payloadPath)
-                        completion(false)
+                        return
                     }
+                    
+                    if let retryStatus = retryStatus, (401...403).contains(retryStatus) {
+                        self.emitAuthError(statusCode: retryStatus)
+                    }
+                    completion(false)
                 }
+                
+                self.trackSyncUpload(retryTask, requestId: retryKey)
                 retryTask.resume()
                 
             case .authFailure:
                 self.logMessage("Token refresh rejected - auth is invalid")
                 self.emitAuthError(statusCode: 401)
-                try? FileManager.default.removeItem(atPath: payloadPath)
                 completion(false)
                 
             case .networkError:
                 self.logMessage("Token refresh failed (network) - will retry later")
                 self.markNetworkError()
-                try? FileManager.default.removeItem(atPath: payloadPath)
                 completion(false)
             }
         }
@@ -293,6 +240,10 @@ extension OpenWearablesHealthSDK {
     private static let outboxMaxItemAge: TimeInterval = 7 * 24 * 3600
     
     /// Retries pending outbox items through the *background* URLSession.
+    ///
+    /// The sync path no longer enqueues items, so this now drains and cleans up what
+    /// earlier SDK versions left on disk. It stays in place as the delivery mechanism
+    /// for uploads that must outlive foreground execution.
     /// - uploads go through the background session (survive suspension/kill),
     /// - the session is limited to one connection per host, so items go out serially,
     /// - a retry pass is skipped while a regular sync is running,
@@ -370,10 +321,13 @@ extension OpenWearablesHealthSDK {
                 
                 if inFlightPayloadPaths.contains(payloadURL.path) { continue }
                 
-                var req = URLRequest(url: endpoint)
-                req.httpMethod = "POST"
-                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                self.applyAuth(to: &req, credential: credential)
+                let itemId = itemURL.deletingPathExtension().lastPathComponent
+                let req = self.buildRequest(
+                    url: endpoint,
+                    credential: credential,
+                    requestId: UUID().uuidString,
+                    outboxItemId: itemId
+                )
                 
                 let task = self.session.uploadTask(with: req, fromFile: payloadURL)
                 task.taskDescription = [itemURL.path, payloadURL.path, item.anchorPath ?? ""].joined(separator: "|")

@@ -182,10 +182,7 @@ extension OpenWearablesHealthSDK {
             return
         }
 
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        applyAuth(to: &req, credential: credential)
+        var req = buildRequest(url: endpoint, credential: credential, requestId: UUID().uuidString)
         req.httpBody = data
 
         let task = foregroundSession.dataTask(with: req) { [weak self] _, response, error in
