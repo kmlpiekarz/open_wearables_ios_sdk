@@ -54,46 +54,6 @@ extension OpenWearablesHealthSDK {
         ]
     }
 
-    // MARK: - Count Samples Per Type
-
-    internal func countSamplesForTypes(
-        _ types: [HKSampleType],
-        startDate: Date?,
-        endDate: Date,
-        completion: @escaping ([String: Int]) -> Void
-    ) {
-        var counts: [String: Int] = [:]
-        let lock = NSLock()
-        let group = DispatchGroup()
-
-        let predicate = HKQuery.predicateForSamples(
-            withStart: startDate ?? .distantPast,
-            end: endDate,
-            options: .strictStartDate
-        )
-
-        for type in types {
-            group.enter()
-            let query = HKSampleQuery(
-                sampleType: type,
-                predicate: predicate,
-                limit: HKObjectQueryNoLimit,
-                sortDescriptors: nil
-            ) { _, results, _ in
-                let count = results?.count ?? 0
-                lock.lock()
-                counts[type.identifier] = count
-                lock.unlock()
-                group.leave()
-            }
-            healthStore.execute(query)
-        }
-
-        group.notify(queue: .global(qos: .userInitiated)) {
-            completion(counts)
-        }
-    }
-
     // MARK: - Sync Start Log
 
     internal func sendSyncStartLog(

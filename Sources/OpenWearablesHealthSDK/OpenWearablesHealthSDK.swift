@@ -732,11 +732,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         if effectiveFullExport {
             let startDate = syncStartDate()
             let endDate = Date()
-            countSamplesForTypes(queryableTypes, startDate: startDate, endDate: endDate) { [weak self] counts in
-                guard let self = self else { return }
-                self.sendSyncStartLog(types: queryableTypes, typeCounts: counts, startDate: startDate, endDate: endDate) {
-                    startRoundRobin()
-                }
+            sendSyncStartLog(types: queryableTypes, typeCounts: [:], startDate: startDate, endDate: endDate) {
+                startRoundRobin()
             }
         } else {
             startRoundRobin()
