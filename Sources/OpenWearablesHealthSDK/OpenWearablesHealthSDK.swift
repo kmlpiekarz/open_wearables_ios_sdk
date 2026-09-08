@@ -177,10 +177,20 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// arrives); without it a single stuck run would block syncing until app restart.
     private static let cancelledSyncTakeoverDelay: TimeInterval = 60
     
+    /// Whether a sync run currently owns the slot. Stays true after `cancelSync()`
+    /// until that run unwinds, so a second loop cannot start on the same SyncState.
     internal var isSyncInProgress: Bool {
         syncLock.lock()
         defer { syncLock.unlock() }
         return isSyncing
+    }
+    
+    /// What apps should show as "syncing". False as soon as cancel is requested,
+    /// even if the outgoing run has not reached a checkpoint yet.
+    internal var isSyncingVisible: Bool {
+        syncLock.lock()
+        defer { syncLock.unlock() }
+        return isSyncing && cancelRequestedAt == nil
     }
     
     // Uploads owned by the sync path, keyed by request id. Tracked so cancellation can
@@ -192,6 +202,22 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Why the last upload cancellation was issued, so an `NSURLErrorCancelled` in the
     /// logs can be attributed instead of guessed.
     private var lastCancellation: (reason: String, at: Date)?
+    
+    /// Bumped on sign-in / sign-out so a late outbox callback cannot apply anchors
+    /// or `fullDone` for a user who has already left.
+    private var sessionEpoch: Int = 0
+    
+    internal func bumpSessionEpoch() {
+        syncLock.lock()
+        sessionEpoch += 1
+        syncLock.unlock()
+    }
+    
+    internal func currentSessionEpoch() -> Int {
+        syncLock.lock()
+        defer { syncLock.unlock() }
+        return sessionEpoch
+    }
     
     // Outbox retry state
     internal var isRetryingOutbox = false
@@ -318,6 +344,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         
+        bumpSessionEpoch()
         clearSyncSession()
         resetAllAnchors()
         clearOutbox()
@@ -337,6 +364,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     public func signOut() {
         logMessage("Signing out")
         
+        bumpSessionEpoch()
         cancelSync()
         stopBackgroundDelivery()
         stopNetworkMonitoring()
@@ -732,7 +760,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         if effectiveFullExport {
             let startDate = syncStartDate()
             let endDate = Date()
-            sendSyncStartLog(types: queryableTypes, typeCounts: [:], startDate: startDate, endDate: endDate) {
+            // Counts come from SyncState (already sent), not a HealthKit scan — that
+            // scan was the CPU/thermal spike on sync start. Fresh sessions report 0.
+            var typeCounts: [String: Int] = [:]
+            if let state = existingState {
+                for type in queryableTypes {
+                    typeCounts[type.identifier] = state.typeProgress[type.identifier]?.sentCount ?? 0
+                }
+            }
+            sendSyncStartLog(types: queryableTypes, typeCounts: typeCounts, startDate: startDate, endDate: endDate) {
                 startRoundRobin()
             }
         } else {
@@ -846,6 +882,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         ) { [weak self] success, results in
             guard let self = self else { completion(false); return }
             if !success { completion(false); return }
+            if self.isSyncCancelled(generation: rrState.generation) {
+                completion(false)
+                return
+            }
             
             // Update cursors for types that aren't done
             for result in results where !result.isDone {
@@ -912,10 +952,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             let payload = self.serializeCombinedStreaming(samples: allSamples)
             
             self.uploadCombinedPayload(
-                payload: payload, endpoint: endpoint, credential: freshCredential
+                payload: payload, endpoint: endpoint, credential: freshCredential,
+                generation: rrState.generation
             ) { [weak self] sendSuccess in
                 guard let self = self else { completion(false); return }
                 if !sendSuccess { completion(false); return }
+                if self.isSyncCancelled(generation: rrState.generation) {
+                    completion(false)
+                    return
+                }
                 
                 // Phase 3: Update progress for all types that had data
                 for result in withData {
@@ -1021,6 +1066,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let type = types[index]
         captureCurrentAnchor(for: type) { [weak self] anchor in
             guard let self = self else { completion(false); return }
+            if self.isSyncCancelled(generation: rrState.generation) {
+                completion(false)
+                return
+            }
             
             // Without a valid anchor the type must NOT be marked complete: the next
             // incremental sync would run an anchored query from nil and re-crawl the
@@ -1199,20 +1248,31 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// another run still owns it.
     private func beginSyncRun() -> Int? {
         syncLock.lock()
-        defer { syncLock.unlock() }
         
+        var takeOverStaleRun = false
         if isSyncing {
+            // Only after cancelSync(): a HealthKit callback that never arrives
+            // without a cancel still holds the slot until process death. That is
+            // preferable to silently starting a second writer on SyncState.
             guard let requestedAt = cancelRequestedAt,
                   Date().timeIntervalSince(requestedAt) > OpenWearablesHealthSDK.cancelledSyncTakeoverDelay else {
+                syncLock.unlock()
                 return nil
             }
+            takeOverStaleRun = true
             NSLog("[OpenWearablesHealthSDK] Cancelled sync did not unwind - taking over the sync slot")
         }
         
         syncGeneration += 1
         isSyncing = true
         cancelRequestedAt = nil
-        return syncGeneration
+        let generation = syncGeneration
+        syncLock.unlock()
+        
+        if takeOverStaleRun {
+            cancelInFlightSyncUploads(reason: "syncTakeover")
+        }
+        return generation
     }
     
     /// True once this run has been cancelled, or once a newer run has taken the slot.

@@ -10,6 +10,7 @@
 * **Upload failures are visible** (#29): `NSURLErrorCancelled` is no longer suppressed. Every upload now records request id, declared bytes, `countOfBytesSent` against `countOfBytesExpectedToSend`, HTTP status, error domain/code and, for a cancellation, whether it came from `cancelSync()`, background expiration or the system. Failures are logged at a level that survives release builds.
 * **Request attribution headers** (#30): every SDK request now sends `X-Open-Wearables-SDK-Version`, `X-Open-Wearables-SDK-Platform`, a `User-Agent` with SDK version, iOS version and device model, and a per-request `X-Request-Id` (reused across a 401 retry). Outbox uploads also send `X-Open-Wearables-Outbox-Item`.
 * **Removed the manual `Content-Length` header** (#32), which is reserved and managed by Foundation, and the unused `bufferLock` (#33).
+* **HTTP 4xx no longer advances sync progress**: a 400 (including the production `ClientDisconnect`) fails the chunk so cursors stay put and the next wake rebuilds the payload. Cancelled or superseded sync generations do not write `SyncState`. Late outbox callbacks after `signOut` are ignored.
 
 ## 0.14.0
 

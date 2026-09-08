@@ -34,10 +34,18 @@ extension OpenWearablesHealthSDK {
     /// only on a 2xx, so an interrupted round is rebuilt from HealthKit by the next
     /// sync. A persisted copy could only ever be replayed as a duplicate of data that
     /// the next sync re-fetches anyway, while `SyncState` knew nothing about it.
+    /// Whether a combined-upload HTTP status should advance SyncState.
+    /// Only 2xx means the server accepted the body. 4xx (including the production
+    /// `ClientDisconnect` 400) must not move cursors — the chunk is rebuilt later.
+    internal static func syncShouldAdvance(afterHTTPStatus statusCode: Int) -> Bool {
+        (200...299).contains(statusCode)
+    }
+    
     internal func uploadCombinedPayload(
         payload: [String: Any],
         endpoint: URL,
         credential: String,
+        generation: Int,
         completion: @escaping (Bool) -> Void
     ) {
         guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
@@ -62,6 +70,11 @@ extension OpenWearablesHealthSDK {
                 task: completedTask, statusCode: statusCode, error: error
             )
             
+            if self.isSyncCancelled(generation: generation) {
+                completion(false)
+                return
+            }
+            
             if error != nil {
                 self.markNetworkError()
                 completion(false)
@@ -75,7 +88,7 @@ extension OpenWearablesHealthSDK {
                 return
             }
             
-            if (200...299).contains(statusCode) {
+            if OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: statusCode) {
                 completion(true)
                 return
             }
@@ -85,6 +98,7 @@ extension OpenWearablesHealthSDK {
                     payloadData: payloadData,
                     endpoint: endpoint,
                     requestId: requestId,
+                    generation: generation,
                     completion: completion
                 )
                 return
@@ -95,12 +109,7 @@ extension OpenWearablesHealthSDK {
                 self.logDiagnostic("HTTP \(statusCode) - \(truncated)")
             }
             
-            if (400...499).contains(statusCode) {
-                self.logMessage("Skipping chunk due to \(statusCode) - continuing sync")
-                completion(true)
-            } else {
-                completion(false)
-            }
+            completion(false)
         }
         
         trackSyncUpload(task, requestId: requestId)
@@ -113,6 +122,7 @@ extension OpenWearablesHealthSDK {
         payloadData: Data,
         endpoint: URL,
         requestId: String,
+        generation: Int,
         completion: @escaping (Bool) -> Void
     ) {
         if isApiKeyAuth {
@@ -126,6 +136,11 @@ extension OpenWearablesHealthSDK {
         
         self.attemptTokenRefresh { [weak self] result in
             guard let self = self else { return }
+            
+            if self.isSyncCancelled(generation: generation) {
+                completion(false)
+                return
+            }
             
             switch result {
             case .success:
@@ -150,13 +165,18 @@ extension OpenWearablesHealthSDK {
                         task: completedTask, statusCode: retryStatus, error: retryError
                     )
                     
+                    if self.isSyncCancelled(generation: generation) {
+                        completion(false)
+                        return
+                    }
+                    
                     if retryError != nil {
                         self.markNetworkError()
                         completion(false)
                         return
                     }
                     
-                    if let retryStatus = retryStatus, (200...299).contains(retryStatus) {
+                    if let retryStatus = retryStatus, OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: retryStatus) {
                         completion(true)
                         return
                     }
@@ -188,6 +208,17 @@ extension OpenWearablesHealthSDK {
         guard let itemData = try? Data(contentsOf: URL(fileURLWithPath: itemPath)),
               let item = try? JSONDecoder().decode(OutboxItem.self, from: itemData) else {
             logMessage("Failed to read item for anchor saving")
+            return
+        }
+        
+        // signOut() clears credentials and the outbox asynchronously relative to
+        // background-session callbacks. Do not persist anchors or fullDone for a
+        // user who is gone, or for an item that belongs to a previous session.
+        guard OpenWearablesHealthSdkKeychain.hasSession(), item.userKey == userKey() else {
+            if let anchorPath = anchorPath, !anchorPath.isEmpty {
+                try? FileManager.default.removeItem(atPath: anchorPath)
+            }
+            try? FileManager.default.removeItem(atPath: itemPath)
             return
         }
         
@@ -241,9 +272,8 @@ extension OpenWearablesHealthSDK {
     
     /// Retries pending outbox items through the *background* URLSession.
     ///
-    /// The sync path no longer enqueues items, so this now drains and cleans up what
-    /// earlier SDK versions left on disk. It stays in place as the delivery mechanism
-    /// for uploads that must outlive foreground execution.
+    /// The sync path no longer enqueues items. This only drains leftovers from
+    /// earlier SDK versions and then expires them.
     /// - uploads go through the background session (survive suspension/kill),
     /// - the session is limited to one connection per host, so items go out serially,
     /// - a retry pass is skipped while a regular sync is running,
@@ -330,7 +360,7 @@ extension OpenWearablesHealthSDK {
                 )
                 
                 let task = self.session.uploadTask(with: req, fromFile: payloadURL)
-                task.taskDescription = [itemURL.path, payloadURL.path, item.anchorPath ?? ""].joined(separator: "|")
+                task.taskDescription = [itemURL.path, payloadURL.path, item.anchorPath ?? "", "\(self.currentSessionEpoch())"].joined(separator: "|")
                 task.resume()
                 enqueued += 1
             }

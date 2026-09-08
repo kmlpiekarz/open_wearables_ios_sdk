@@ -9,6 +9,14 @@ extension OpenWearablesHealthSDK {
         let itemPath = parts.count > 0 ? parts[0] : ""
         let payloadPath = parts.count > 1 ? parts[1] : ""
         let anchorPath = parts.count > 2 ? parts[2] : ""
+        let enqueuedEpoch = parts.count > 3 ? Int(parts[3]) : nil
+        
+        if let enqueuedEpoch = enqueuedEpoch, enqueuedEpoch != currentSessionEpoch() {
+            if !payloadPath.isEmpty { try? FileManager.default.removeItem(atPath: payloadPath) }
+            if !anchorPath.isEmpty { try? FileManager.default.removeItem(atPath: anchorPath) }
+            if !itemPath.isEmpty { try? FileManager.default.removeItem(atPath: itemPath) }
+            return
+        }
 
         if backgroundDataBuffer[task.taskIdentifier] != nil {
             backgroundDataBuffer.removeValue(forKey: task.taskIdentifier)
@@ -94,6 +102,7 @@ extension OpenWearablesHealthSDK {
     }
     
     public func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
+        guard totalBytesExpectedToSend > 0 else { return }
         let progress = Double(totalBytesSent) / Double(totalBytesExpectedToSend) * 100
         if Int(progress) % 20 == 0 || progress > 99 {
             NSLog("[OpenWearablesHealthSDK] Upload progress: \(String(format: "%.1f", progress))%% (\(totalBytesSent)/\(totalBytesExpectedToSend) bytes)")
