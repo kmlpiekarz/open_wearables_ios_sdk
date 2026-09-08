@@ -40,4 +40,62 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertFalse(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 500))
         XCTAssertFalse(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 0))
     }
+
+    func testConfigureWithTokenRefreshURLPersistsOverride() {
+        let sdk = OpenWearablesHealthSDK.shared
+        let refreshURL = "https://auth.example.com/v1/wearables/session"
+        sdk.configure(host: "https://sync.example.com", tokenRefreshURL: refreshURL)
+
+        XCTAssertEqual(OpenWearablesHealthSdkKeychain.getCustomRefreshUrl(), refreshURL)
+        XCTAssertEqual(sdk.tokenRefreshEndpoint?.absoluteString, refreshURL)
+        XCTAssertEqual(sdk.getStoredCredentials()["tokenRefreshURL"] as? String, refreshURL)
+    }
+
+    func testConfigureWithoutTokenRefreshURLClearsOverride() {
+        let sdk = OpenWearablesHealthSDK.shared
+        sdk.configure(
+            host: "https://sync.example.com",
+            tokenRefreshURL: "https://auth.example.com/refresh"
+        )
+        XCTAssertNotNil(OpenWearablesHealthSdkKeychain.getCustomRefreshUrl())
+
+        sdk.configure(host: "https://sync.example.com")
+        XCTAssertNil(OpenWearablesHealthSdkKeychain.getCustomRefreshUrl())
+        XCTAssertEqual(
+            sdk.tokenRefreshEndpoint?.absoluteString,
+            "https://sync.example.com/api/v1/token/refresh"
+        )
+    }
+
+    func testConfigureTreatsBlankTokenRefreshURLAsDefault() {
+        let sdk = OpenWearablesHealthSDK.shared
+        sdk.configure(
+            host: "https://sync.example.com",
+            tokenRefreshURL: "https://auth.example.com/refresh"
+        )
+        sdk.configure(host: "https://sync.example.com", tokenRefreshURL: "   ")
+        XCTAssertNil(OpenWearablesHealthSdkKeychain.getCustomRefreshUrl())
+        XCTAssertEqual(
+            sdk.tokenRefreshEndpoint?.absoluteString,
+            "https://sync.example.com/api/v1/token/refresh"
+        )
+    }
+
+    func testAbsoluteHTTPURLRejectsRelativeAndNonHTTP() {
+        XCTAssertNil(OpenWearablesHealthSDK.absoluteHTTPURL(from: "/token/refresh"))
+        XCTAssertNil(OpenWearablesHealthSDK.absoluteHTTPURL(from: "token/refresh"))
+        XCTAssertNil(OpenWearablesHealthSDK.absoluteHTTPURL(from: "ftp://auth.example.com/refresh"))
+        XCTAssertEqual(
+            OpenWearablesHealthSDK.absoluteHTTPURL(from: " https://auth.example.com/v1/refresh ")?.absoluteString,
+            "https://auth.example.com/v1/refresh"
+        )
+    }
+
+    func testInvalidPersistedRefreshURLDoesNotFallBackToSyncHost() {
+        let sdk = OpenWearablesHealthSDK.shared
+        sdk.configure(host: "https://sync.example.com")
+        OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl("not-a-url")
+        XCTAssertNil(sdk.tokenRefreshEndpoint)
+        sdk.configure(host: "https://sync.example.com")
+    }
 }
