@@ -258,7 +258,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // MARK: - API Endpoints
     
     internal var apiBaseUrl: String? {
-        guard let host = host else { return nil }
+        guard let host = host ?? OpenWearablesHealthSdkKeychain.getHost() else { return nil }
         let h = host.hasSuffix("/") ? String(host.dropLast()) : host
         return "\(h)/api/v1"
     }
@@ -268,11 +268,37 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         guard let base = apiBaseUrl else { return nil }
         return URL(string: "\(base)/sdk/users/\(userId)/sync")
     }
+
+    /// Token-refresh URL. An absolute `tokenRefreshURL` from `configure` wins;
+    /// otherwise `{host}/api/v1/token/refresh`. A stored override that is not a
+    /// valid `http(s)` URL is treated as missing rather than falling back to the
+    /// sync host (that would silently refresh against the wrong server).
+    internal var tokenRefreshEndpoint: URL? {
+        if let custom = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl(), !custom.isEmpty {
+            return Self.absoluteHTTPURL(from: custom)
+        }
+        guard let base = apiBaseUrl else { return nil }
+        return URL(string: "\(base)/token/refresh")
+    }
+
+    internal static func absoluteHTTPURL(from string: String) -> URL? {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil else {
+            return nil
+        }
+        return url
+    }
     
     // MARK: - Init
     
     private override init() {
         super.init()
+        // Fresh BGTask processes never see `configure` before the first refresh.
+        self.host = OpenWearablesHealthSdkKeychain.getHost()
         
         let bgCfg = URLSessionConfiguration.background(withIdentifier: bgSessionId)
         bgCfg.isDiscretionary = false
@@ -311,18 +337,33 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     /// Initialize the SDK with the backend host URL.
     /// This also restores previously tracked types and auto-resumes sync if it was active.
-    public func configure(host: String) {
+    ///
+    /// - Parameters:
+    ///   - host: Base host for the data-sync API (`{host}/api/v1/...`).
+    ///   - tokenRefreshURL: Optional absolute URL used to refresh the access
+    ///     token (`POST {"refresh_token"}` → `{"access_token","refresh_token"}`).
+    ///     When omitted or empty, the SDK uses `{host}/api/v1/token/refresh`
+    ///     and clears any previously stored override. Pass this on every
+    ///     `configure` call when the auth/mint server is not the sync host —
+    ///     the value is persisted so a background `BGTask` in a fresh process
+    ///     can refresh before `configure` runs again.
+    public func configure(host: String, tokenRefreshURL: String? = nil) {
         OpenWearablesHealthSdkKeychain.clearKeychainIfReinstalled()
         
         self.host = host
         OpenWearablesHealthSdkKeychain.saveHost(host)
+        OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(tokenRefreshURL)
         
         if let storedTypes = OpenWearablesHealthSdkKeychain.getTrackedTypes() {
             self.trackedTypes = mapTypesFromStrings(storedTypes)
             logMessage("Restored \(trackedTypes.count) tracked types")
         }
         
-        logMessage("Configured: host=\(host)")
+        if let tokenRefreshURL = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl() {
+            logMessage("Configured: host=\(host), tokenRefreshURL=\(tokenRefreshURL)")
+        } else {
+            logMessage("Configured: host=\(host)")
+        }
         
         if OpenWearablesHealthSdkKeychain.isSyncActive() && OpenWearablesHealthSdkKeychain.hasSession() && !trackedTypes.isEmpty {
             logMessage("Auto-restoring background sync...")
@@ -543,6 +584,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             "refreshToken": OpenWearablesHealthSdkKeychain.getRefreshToken(),
             "apiKey": OpenWearablesHealthSdkKeychain.getApiKey(),
             "host": OpenWearablesHealthSdkKeychain.getHost(),
+            "tokenRefreshURL": OpenWearablesHealthSdkKeychain.getCustomRefreshUrl(),
             "isSyncActive": OpenWearablesHealthSdkKeychain.isSyncActive()
         ]
     }
@@ -1477,9 +1519,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         
-        guard let refreshToken = self.refreshToken, let base = self.apiBaseUrl else {
+        guard let refreshToken = self.refreshToken, let url = self.tokenRefreshEndpoint else {
             tokenRefreshLock.unlock()
-            logMessage("Token refresh failed: no credentials")
+            logMessage("Token refresh failed: no credentials or refresh URL")
             completion(.authFailure)
             return
         }
@@ -1487,12 +1529,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         isRefreshingToken = true
         tokenRefreshCallbacks.append(completion)
         tokenRefreshLock.unlock()
-        
-        guard let url = URL(string: "\(base)/token/refresh") else {
-            logMessage("Token refresh failed: invalid URL")
-            finishTokenRefresh(result: .authFailure)
-            return
-        }
         
         var req = buildRequest(url: url, credential: nil, requestId: UUID().uuidString)
         

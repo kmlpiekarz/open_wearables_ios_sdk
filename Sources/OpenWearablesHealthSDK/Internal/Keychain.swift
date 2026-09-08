@@ -15,6 +15,7 @@ internal class OpenWearablesHealthSdkKeychain {
     private static let baseUrlKey = "baseUrl"
     private static let hostKey = "host"
     private static let customSyncUrlKey = "customSyncUrl"
+    private static let customRefreshUrlKey = "customRefreshUrl"
     private static let syncActiveKey = "syncActive"
     private static let trackedTypesKey = "trackedTypes"
     private static let appInstalledKey = "appInstalled"
@@ -107,6 +108,22 @@ internal class OpenWearablesHealthSdkKeychain {
     static func getCustomSyncUrl() -> String? {
         return defaults.string(forKey: customSyncUrlKey)
     }
+
+    /// Optional override for the token-refresh endpoint. When unset, the SDK
+    /// refreshes against `{apiBaseUrl}/token/refresh`. Persisted in the shared
+    /// suite so a background refresh task (fresh process) can read it.
+    static func saveCustomRefreshUrl(_ url: String?) {
+        if let url = url?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty {
+            defaults.set(url, forKey: customRefreshUrlKey)
+        } else {
+            defaults.removeObject(forKey: customRefreshUrlKey)
+        }
+        defaults.synchronize()
+    }
+
+    static func getCustomRefreshUrl() -> String? {
+        return defaults.string(forKey: customRefreshUrlKey)
+    }
     
     // MARK: - Sync Active State
     
@@ -161,6 +178,7 @@ internal class OpenWearablesHealthSdkKeychain {
         delete(key: apiKeyKey)
         defaults.removeObject(forKey: hostKey)
         defaults.removeObject(forKey: customSyncUrlKey)
+        defaults.removeObject(forKey: customRefreshUrlKey)
         defaults.removeObject(forKey: syncActiveKey)
         defaults.removeObject(forKey: trackedTypesKey)
         defaults.removeObject(forKey: syncDaysBackKey)

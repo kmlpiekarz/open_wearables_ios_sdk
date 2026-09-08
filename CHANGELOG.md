@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+* **Configurable token-refresh URL**: `configure(host:tokenRefreshURL:)` accepts an optional absolute refresh endpoint for deployments whose auth/mint server is not the sync host. Omitted or blank keeps `{host}/api/v1/token/refresh`. The override is persisted so a background `BGTask` in a fresh process can refresh before `configure` runs again. Request/response contract is unchanged (`POST {"refresh_token"}` → `{"access_token","refresh_token"}`).
 * **Fixed sync cancellation races** (#26): `cancelSync()` used to set its cancel flag, clear `isSyncing` and reset the flag synchronously, so a running loop could miss the whole cancellation window while a second sync started on top of it. Runs are now identified by a generation counter, the flag is never reset behind a live run, and the slot is released only when the loop actually unwinds (with a 60s takeover for a wedged run).
 * **Cancellation no longer kills unrelated requests** (#26): sync uploads are tracked individually and cancelled by identity, instead of cancelling every task on the shared foreground session — which also aborted token refreshes (surfacing as `.networkError`) and telemetry.
 * **No more duplicate replays from the outbox** (#27): the sync path no longer writes outbox items. They carried no anchors and no progress deltas, so a successful replay re-sent records that `SyncState` had already counted. `SyncState` is now the single source of resumable progress; leftover items from older versions are still drained and cleaned up.
