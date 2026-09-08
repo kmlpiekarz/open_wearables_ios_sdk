@@ -199,7 +199,7 @@ extension OpenWearablesHealthSDK {
                 "completedTypes": state.completedTypes.count,
                 "isFullExport": state.fullExport,
                 "initialExportDone": initialExportDone,
-                "isSyncing": isSyncInProgress,
+                "isSyncing": isSyncingVisible,
                 "createdAt": ISO8601DateFormatter().string(from: state.createdAt)
             ]
         } else {
@@ -209,7 +209,7 @@ extension OpenWearablesHealthSDK {
                 "completedTypes": 0,
                 "isFullExport": false,
                 "initialExportDone": initialExportDone,
-                "isSyncing": isSyncInProgress,
+                "isSyncing": isSyncingVisible,
                 "createdAt": NSNull()
             ]
         }

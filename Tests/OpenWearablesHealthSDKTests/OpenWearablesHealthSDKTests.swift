@@ -31,4 +31,13 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertNotNil(status["completedTypes"])
         XCTAssertNotNil(status["isFullExport"])
     }
+    
+    func testSyncShouldAdvanceOnlyOn2xx() {
+        XCTAssertTrue(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 200))
+        XCTAssertTrue(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 201))
+        XCTAssertFalse(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 400))
+        XCTAssertFalse(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 401))
+        XCTAssertFalse(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 500))
+        XCTAssertFalse(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 0))
+    }
 }
