@@ -491,6 +491,12 @@ extension OpenWearablesHealthSDK {
              HKObjectType.quantityType(forIdentifier: .bloodPressureDiastolic):
             return HKUnit.millimeterOfMercury()
         default:
+            if #available(iOS 18.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .workoutEffortScore)
+                    || qt == HKObjectType.quantityType(forIdentifier: .estimatedWorkoutEffortScore) {
+                    return .appleEffortScore()
+                }
+            }
             return .count()
         }
     }
@@ -561,6 +567,12 @@ extension OpenWearablesHealthSDK {
         case HKObjectType.quantityType(forIdentifier: .dietaryWater):
             return (.liter(), "L")
         default:
+            if #available(iOS 18.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .workoutEffortScore)
+                    || qt == HKObjectType.quantityType(forIdentifier: .estimatedWorkoutEffortScore) {
+                    return (.appleEffortScore(), "appleEffortScore")
+                }
+            }
             return (.count(), "count")
         }
     }
